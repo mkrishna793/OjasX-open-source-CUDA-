@@ -125,7 +125,7 @@ class CLBufferPool:
         if cl_buf is None:
             cl_buf = self.allocate(nbytes, host_array.dtype, host_array.shape)
 
-        cl.enqueue_copy(queue, cl_buf.buffer, host_array)
+        cl.enqueue_copy(queue, cl_buf.buffer, host_array, is_blocking=True)
         return cl_buf
 
     def device_to_host(

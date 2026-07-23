@@ -312,6 +312,49 @@ class OpenCLEngine:
                a_buf.buffer, out_buf.buffer,
                np.int32(M), np.int32(N))
 
+    def run_linear(
+        self,
+        a_buf: CLBuffer,
+        b_buf: CLBuffer,
+        bias_buf: CLBuffer | None,
+        out_buf: CLBuffer,
+        M: int,
+        N: int,
+        K: int,
+        use_tiled: bool = True,
+    ) -> None:
+        """Run fused linear layer: C[M,N] = A[M,K] @ B[N,K]^T + bias[N]."""
+        queue = get_queue()
+        device_info = get_device_info()
+        has_bias = 1 if bias_buf is not None else 0
+        bias_raw = bias_buf.buffer if bias_buf is not None else a_buf.buffer
+
+        if use_tiled and M >= 16 and N >= 16 and K >= 16:
+            tile_size = 16
+            if device_info["local_mem_size_kb"] < 8:
+                tile_size = 8
+
+            kernel = self._registry.get_kernel(
+                "matmul.cl", "linear_forward_tiled_f32",
+                build_options=f"-DTILE_SIZE={tile_size}"
+            )
+            global_size = (
+                self._compute_global_size(M, tile_size),
+                self._compute_global_size(N, tile_size),
+            )
+            local_size = (tile_size, tile_size)
+        else:
+            kernel = self._registry.get_kernel("matmul.cl", "linear_forward_f32")
+            global_size = (
+                self._compute_global_size(M, 16),
+                self._compute_global_size(N, 16),
+            )
+            local_size = None
+
+        kernel(queue, global_size, local_size,
+               a_buf.buffer, b_buf.buffer, bias_raw, out_buf.buffer,
+               np.int32(M), np.int32(N), np.int32(K), np.int32(has_bias))
+
     # ── Activation backward ──────────────────────────────────────
 
     def run_activation_backward(
@@ -681,6 +724,55 @@ class OpenCLEngine:
                Q.buffer, K.buffer, V.buffer, Out.buffer,
                np.int32(B), np.int32(H), np.int32(M), np.int32(N), np.int32(D),
                np.float32(scale))
+
+    def run_sum_columns(
+        self,
+        input_buf: CLBuffer,
+        out_buf: CLBuffer,
+        rows: int,
+        cols: int,
+    ) -> None:
+        """Sum input_buf[rows, cols] along columns to out_buf[cols]."""
+        queue = get_queue()
+        kernel = self._registry.get_kernel("reduction.cl", "sum_columns_f32")
+        global_size = (self._compute_global_size(cols),)
+        local_size = (min(256, cols),) if cols >= 256 else None
+        kernel(queue, global_size, local_size,
+               input_buf.buffer, out_buf.buffer,
+               np.int32(rows), np.int32(cols))
+
+    def run_reshape_grad_out(
+        self,
+        input_buf: CLBuffer,
+        out_buf: CLBuffer,
+        N: int, C: int, S: int,
+    ) -> None:
+        """Reshape/transpose grad_output [N, C, H_out * W_out] to [C, N * H_out * W_out]."""
+        queue = get_queue()
+        kernel = self._registry.get_kernel("conv.cl", "reshape_grad_out_f32")
+        global_size = (
+            self._compute_global_size(C, 16),
+            self._compute_global_size(N * S, 16),
+        )
+        local_size = None
+        kernel(queue, global_size, local_size,
+               input_buf.buffer, out_buf.buffer,
+               np.int32(N), np.int32(C), np.int32(S))
+
+    def run_conv2d_bias_backward(
+        self,
+        grad_out_buf: CLBuffer,
+        out_buf: CLBuffer,
+        N: int, C: int, H: int, W: int,
+    ) -> None:
+        """Sum grad_out_buf[N, C, H, W] along axes (0, 2, 3) to out_buf[C]."""
+        queue = get_queue()
+        kernel = self._registry.get_kernel("reduction.cl", "sum_conv2d_bias_f32")
+        global_size = (self._compute_global_size(C),)
+        local_size = (min(256, C),) if C >= 256 else None
+        kernel(queue, global_size, local_size,
+               grad_out_buf.buffer, out_buf.buffer,
+               np.int32(N), np.int32(C), np.int32(H), np.int32(W))
 
 
 # ── Module-level singleton ───────────────────────────────────────────

@@ -314,6 +314,97 @@ class MatmulFunction(torch.autograd.Function):
         return grad_a_handle, grad_b_handle
 
 
+class DivFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+        engine = get_engine()
+        shape = _get_shape(a)
+        n = int(np.prod(shape))
+        out_handle, out_buf = _alloc(shape)
+        engine.run_elementwise_binary("div_f32", _get_buf(a), _get_buf(b), out_buf, n)
+        ctx.save_for_backward(a, b)
+        return out_handle
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        a, b = ctx.saved_tensors
+        engine = get_engine()
+        shape = _get_shape(grad_output)
+        n = int(np.prod(shape))
+        
+        # grad_a = grad_output / b
+        grad_a_handle, grad_a_buf = _alloc(shape)
+        engine.run_elementwise_binary("div_f32", _get_buf(grad_output), _get_buf(b), grad_a_buf, n)
+        
+        # grad_b = -grad_output * a / (b * b)
+        b_sq_handle, b_sq_buf = _alloc(shape)
+        engine.run_elementwise_binary("mul_f32", _get_buf(b), _get_buf(b), b_sq_buf, n)
+        
+        neg_a_handle, neg_a_buf = _alloc(shape)
+        engine.run_elementwise_unary("neg_f32", _get_buf(a), neg_a_buf, n)
+        
+        factor_handle, factor_buf = _alloc(shape)
+        engine.run_elementwise_binary("div_f32", _get_buf(neg_a_handle), _get_buf(b_sq_handle), factor_buf, n)
+        
+        grad_b_handle, grad_b_buf = _alloc(shape)
+        engine.run_elementwise_binary("mul_f32", _get_buf(grad_output), _get_buf(factor_handle), grad_b_buf, n)
+        
+        return grad_a_handle, grad_b_handle
+
+
+class LinearFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor] = None) -> torch.Tensor:
+        engine = get_engine()
+        x_shape = _get_shape(x)
+        w_shape = _get_shape(weight)
+        
+        M, K = x_shape
+        N, K2 = w_shape
+        assert K == K2, f"Linear dimension mismatch: input {x_shape}, weight {w_shape}"
+        
+        out_shape = (M, N)
+        out_handle, out_buf = _alloc(out_shape)
+        
+        x_buf = _get_buf(x)
+        w_buf = _get_buf(weight)
+        bias_buf = _get_buf(bias) if bias is not None else None
+        
+        engine.run_linear(x_buf, w_buf, bias_buf, out_buf, M, N, K)
+        
+        ctx.save_for_backward(x, weight, bias)
+        ctx._M = M
+        ctx._N = N
+        ctx._K = K
+        ctx._has_bias = bias is not None
+        return out_handle
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        x, weight, bias = ctx.saved_tensors
+        engine = get_engine()
+        M, N, K = ctx._M, ctx._N, ctx._K
+        
+        # grad_x = grad_output @ weight
+        grad_x_handle, grad_x_buf = _alloc((M, K))
+        engine.run_matmul(_get_buf(grad_output), _get_buf(weight), grad_x_buf, M, K, N)
+        
+        # grad_weight = grad_output.T @ x
+        grad_out_t_handle, grad_out_t_buf = _alloc((N, M))
+        engine.run_transpose(_get_buf(grad_output), grad_out_t_buf, M, N)
+        
+        grad_w_handle, grad_w_buf = _alloc((N, K))
+        engine.run_matmul(grad_out_t_buf, _get_buf(x), grad_w_buf, N, K, M)
+        
+        # grad_bias = grad_output.sum(dim=0)
+        grad_bias_handle = None
+        if ctx._has_bias:
+            grad_bias_handle, grad_bias_buf = _alloc((N,))
+            engine.run_sum_columns(_get_buf(grad_output), grad_bias_buf, M, N)
+            
+        return grad_x_handle, grad_w_handle, grad_bias_handle
+
+
 # ═══════════════════════════════════════════════════════════════════════
 # Layer Normalization
 # ═══════════════════════════════════════════════════════════════════════
@@ -526,14 +617,15 @@ class Conv2dFunction(torch.autograd.Function):
         C_out, C_in_w, kH, kW = w_shape
         H_out = out_shape[2]
         W_out = out_shape[3]
+        S = H_out * W_out
         
+        # 1. Compute grad_bias entirely on GPU
         grad_bias_handle = None
         if bias_handle is not None:
-            grad_out_np = to_cpu(grad_output).numpy()
-            grad_bias_np = grad_out_np.sum(axis=(0, 2, 3))
-            grad_bias_buf = pool.host_to_device(grad_bias_np)
-            grad_bias_handle = _wrap_output(grad_bias_buf, (C_out,))
+            grad_bias_handle, grad_bias_buf = _alloc((C_out,))
+            engine.run_conv2d_bias_backward(_get_buf(grad_output), grad_bias_buf, N, C_out, H_out, W_out)
 
+        # 2. Get/Compute im2col column buffer
         if ctx._strategy == "direct" or getattr(ctx, "_cols_buf", None) is None:
             cols_rows = N * H_out * W_out
             cols_cols = C_in * kH * kW
@@ -547,19 +639,22 @@ class Conv2dFunction(torch.autograd.Function):
         else:
             cols_buf = ctx._cols_buf
 
-        grad_out_np = to_cpu(grad_output).numpy().reshape(N, C_out, H_out * W_out)
-        grad_out_flat = grad_out_np.transpose(1, 0, 2).reshape(C_out, N * H_out * W_out)
-        cols_np = pool.device_to_host(cols_buf, np.float32, cols_buf.shape)
-        
-        grad_w_np = grad_out_flat @ cols_np
-        grad_w_np = grad_w_np.reshape(C_out, C_in, kH, kW)
-        grad_w_buf = pool.host_to_device(grad_w_np)
-        grad_weight_handle = _wrap_output(grad_w_buf, w_shape)
+        # 3. Reshape/Transpose grad_output on GPU: N, C_out, H_out * W_out -> C_out, N * H_out * W_out
+        grad_out_flat_buf = pool.allocate(C_out * N * S * 4, np.dtype(np.float32), (C_out, N * S))
+        engine.run_reshape_grad_out(_get_buf(grad_output), grad_out_flat_buf, N, C_out, S)
 
-        weight_np = to_cpu(weight_handle).numpy().reshape(C_out, C_in * kH * kW)
-        grad_cols_np = grad_out_flat.T @ weight_np
-        grad_cols_buf = pool.host_to_device(grad_cols_np)
+        # 4. Compute grad_weight entirely on GPU: grad_out_flat @ cols_buf
+        grad_weight_handle, grad_w_buf = _alloc(w_shape)
+        engine.run_matmul(grad_out_flat_buf, cols_buf, grad_w_buf, C_out, C_in * kH * kW, N * S)
 
+        # 5. Compute grad_cols entirely on GPU: grad_out_flat.T @ weight
+        grad_out_flat_t_buf = pool.allocate(N * S * C_out * 4, np.dtype(np.float32), (N * S, C_out))
+        engine.run_transpose(grad_out_flat_buf, grad_out_flat_t_buf, C_out, N * S)
+
+        grad_cols_buf = pool.allocate(N * S * C_in * kH * kW * 4, np.dtype(np.float32), (N * S, C_in * kH * kW))
+        engine.run_matmul(grad_out_flat_t_buf, _get_buf(weight_handle), grad_cols_buf, N * S, C_in * kH * kW, C_out)
+
+        # 6. Accumulate to input grad using col2im on GPU
         grad_in_handle, grad_in_buf = _alloc(x_shape)
         pool.zero_fill(grad_in_buf)
         
@@ -570,6 +665,9 @@ class Conv2dFunction(torch.autograd.Function):
             H_out, W_out, N
         )
 
+        # 7. Clean up temporary buffers
+        pool.free(grad_out_flat_buf)
+        pool.free(grad_out_flat_t_buf)
         pool.free(grad_cols_buf)
         if ctx._strategy != "direct":
             pool.free(cols_buf)

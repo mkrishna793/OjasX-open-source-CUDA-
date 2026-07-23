@@ -162,3 +162,18 @@ __kernel void conv2d_direct_3x3_f32(
 
     output[n * C_out * H_out * W_out + c_out * H_out * W_out + h_out * W_out + w_out] = sum;
 }
+
+__kernel void reshape_grad_out_f32(__global const float* input,
+                                   __global float* output,
+                                   const int N,
+                                   const int C,
+                                   const int S) {
+    int c = get_global_id(0); // C dimension
+    int ns = get_global_id(1); // N * S dimension
+
+    if (c < C && ns < N * S) {
+        int n = ns / S;
+        int s = ns % S;
+        output[c * N * S + n * S + s] = input[n * C * S + c * S + s];
+    }
+}

@@ -3,12 +3,14 @@ import numpy as np
 import weakref
 from torchcl.ops.engine import get_engine
 from torchcl.runtime.memory import CLBuffer, get_buffer_pool
+from torchcl.runtime.context import synchronize
 from torchcl.api import (
     _opencl_buffers,
     _wrap_output,
     _get_buf,
     _get_shape,
     _get_dtype,
+    _buffer_lock,
 )
 
 HAS_CPP_EXTENSION = False
@@ -21,14 +23,16 @@ def cpp_allocate(size: int) -> int:
     """Invoked by C++ c10::Allocator to allocate OpenCL buffer."""
     cl_buf = get_buffer_pool().allocate(size)
     ptr = cl_buf.buffer.int_ptr
-    _opencl_buffers[ptr] = cl_buf
-    _cpp_buffers[ptr] = cl_buf
+    with _buffer_lock:
+        _opencl_buffers[ptr] = cl_buf
+        _cpp_buffers[ptr] = cl_buf
     return ptr
 
 def cpp_free(ptr: int) -> None:
     """Invoked by C++ c10::Allocator to free OpenCL buffer."""
-    _cpp_buffers.pop(ptr, None)
-    cl_buf = _opencl_buffers.pop(ptr, None)
+    with _buffer_lock:
+        _cpp_buffers.pop(ptr, None)
+        cl_buf = _opencl_buffers.pop(ptr, None)
     if cl_buf is not None:
         get_buffer_pool().free(cl_buf)
 
@@ -131,7 +135,7 @@ if my_lib is not None:
 
     # Matrix multiplication
     def _get_contiguous_buf(t: torch.Tensor) -> CLBuffer:
-        buf = _opencl_buffers[t.data_ptr()]
+        buf = _get_buf(t)
         t_shape = _get_shape(t)
         
         is_transposed = False
@@ -142,9 +146,9 @@ if my_lib is not None:
             
         if is_transposed:
             engine = get_engine()
-            N, M = t_shape[1], t_shape[0]
-            out_buf = get_buffer_pool().allocate(M * N * 4, np.dtype(np.float32), t_shape)
-            engine.run_transpose(buf, out_buf, N, M)
+            M_orig, N_orig = buf.shape[0], buf.shape[1]
+            out_buf = get_buffer_pool().allocate(M_orig * N_orig * 4, np.dtype(np.float32), t_shape)
+            engine.run_transpose(buf, out_buf, M_orig, N_orig)
             return out_buf
             
         if t.is_contiguous():
@@ -158,26 +162,33 @@ if my_lib is not None:
         a_shape = _get_shape(a)
         b_shape = _get_shape(b)
         out_shape = (a_shape[0], b_shape[1])
-        out = torch.empty(out_shape, dtype=a.dtype, device=a.device)
+        out = torch.empty(*out_shape, dtype=a.dtype)
+        out._torchcl_shape = out_shape
         
         a_buf = _get_contiguous_buf(a)
         b_buf = _get_contiguous_buf(b)
         
         out_ptr = out.data_ptr()
-        if out_ptr not in _opencl_buffers:
-            n = int(np.prod(out_shape))
-            out_buf = get_buffer_pool().allocate(n * 4, np.dtype(np.float32), out_shape)
-            _opencl_buffers[out_ptr] = out_buf
-            _cpp_buffers[out_ptr] = out_buf
-            weakref.finalize(out, cpp_free, out_ptr)
-        else:
-            out_buf = _opencl_buffers[out_ptr]
+        with _buffer_lock:
+            if out_ptr not in _opencl_buffers:
+                n = int(np.prod(out_shape))
+                out_buf = get_buffer_pool().allocate(n * 4, np.dtype(np.float32), out_shape)
+                _opencl_buffers[out_ptr] = out_buf
+                _cpp_buffers[out_ptr] = out_buf
+                weakref.finalize(out, cpp_free, out_ptr)
+            else:
+                out_buf = _opencl_buffers[out_ptr]
         
         engine.run_matmul(a_buf, b_buf, out_buf, a_shape[0], b_shape[1], a_shape[1])
         
-        if a_buf is not _opencl_buffers[a.data_ptr()]:
+        a_orig_buf = _get_buf(a)
+        b_orig_buf = _get_buf(b)
+            
+        if a_buf is not a_orig_buf:
+            synchronize()
             get_buffer_pool().free(a_buf)
-        if b_buf is not _opencl_buffers[b.data_ptr()]:
+        if b_buf is not b_orig_buf:
+            synchronize()
             get_buffer_pool().free(b_buf)
             
         return out

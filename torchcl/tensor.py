@@ -10,23 +10,25 @@ import numpy as np
 
 # ── ATen Op Dispatcher ────────────────────────────────────────────────
 
-# Mapping from PyTorch ATen ops to torchcl functions
+import torchcl.autograd as autograd
+
+# Mapping from PyTorch ATen ops to torchcl autograd functions
 DISPATCH_TABLE = {
-    torch.ops.aten.add.Tensor: torchcl.add,
-    torch.ops.aten.sub.Tensor: torchcl.sub,
-    torch.ops.aten.mul.Tensor: torchcl.mul,
-    torch.ops.aten.div.Tensor: torchcl.div,
+    torch.ops.aten.add.Tensor: autograd.AddFunction.apply,
+    torch.ops.aten.sub.Tensor: autograd.SubFunction.apply,
+    torch.ops.aten.mul.Tensor: autograd.MulFunction.apply,
+    torch.ops.aten.div.Tensor: autograd.DivFunction.apply,
     torch.ops.aten.neg.default: torchcl.neg,
     torch.ops.aten.abs.default: torchcl.abs_,
     torch.ops.aten.exp.default: torchcl.exp,
     torch.ops.aten.log.default: torchcl.log,
     torch.ops.aten.sqrt.default: torchcl.sqrt,
-    torch.ops.aten.relu.default: torchcl.relu,
-    torch.ops.aten.sigmoid.default: torchcl.sigmoid,
-    torch.ops.aten.tanh.default: torchcl.tanh_,
-    torch.ops.aten.gelu.default: torchcl.gelu,
-    torch.ops.aten.silu.default: torchcl.silu,
-    torch.ops.aten.mm.default: torchcl.matmul,
+    torch.ops.aten.relu.default: autograd.ReluFunction.apply,
+    torch.ops.aten.sigmoid.default: autograd.SigmoidFunction.apply,
+    torch.ops.aten.tanh.default: autograd.TanhFunction.apply,
+    torch.ops.aten.gelu.default: autograd.GeluFunction.apply,
+    torch.ops.aten.silu.default: autograd.SiluFunction.apply,
+    torch.ops.aten.mm.default: autograd.MatmulFunction.apply,
 }
 
 def execute_on_cpu(func, *args, **kwargs):
@@ -52,17 +54,8 @@ def dispatch_op(func, *args, **kwargs):
     """Routes the ATen operation to OpenCL or falls back to CPU."""
     if func in DISPATCH_TABLE:
         try:
-            def unwrap(x):
-                return x._elem if isinstance(x, OjasXTensor) else x
-            
-            ocl_args = torch.utils._pytree.tree_map(unwrap, args)
-            ocl_kwargs = torch.utils._pytree.tree_map(unwrap, kwargs)
-            
-            res = DISPATCH_TABLE[func](*ocl_args, **ocl_kwargs)
-            
-            def wrap(x):
-                return OjasXTensor(x) if isinstance(x, torch.Tensor) else x
-            return torch.utils._pytree.tree_map(wrap, res)
+            res = DISPATCH_TABLE[func](*args, **kwargs)
+            return res
         except Exception as e:
             return execute_on_cpu(func, *args, **kwargs)
             
@@ -75,6 +68,8 @@ class OjasXTensor(torch.Tensor):
     """A PyTorch Tensor subclass that intercepts all operations."""
     @staticmethod
     def __new__(cls, elem):
+        if isinstance(elem, cls):
+            return elem
         real_size = getattr(elem, "_torchcl_shape", elem.size())
         dummy = torch.empty(real_size)
         real_strides = dummy.stride()
@@ -112,6 +107,13 @@ class OjasXTensor(torch.Tensor):
 
     def __repr__(self):
         return f"OjasXTensor({self._elem}, device='opencl')"
+
+    def __getattr__(self, name):
+        if name in ("_torchcl_id", "_torchcl_shape", "_torchcl_dtype", 
+                    "_lazy_inputs", "_lazy_op_type", "_lazy_binary_op", "_lazy_ops"):
+            if hasattr(self, "_elem"):
+                return getattr(self._elem, name)
+        raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
 
 
 # ── Monkeypatches for PyTorch ──────────────────────────────────────────
@@ -172,7 +174,7 @@ def _custom_module_to(self, *args, **kwargs):
     return _original_module_to(self, *args, **kwargs)
 
 def _custom_linear_forward(self, input: torch.Tensor) -> torch.Tensor:
-    """Intercepts Linear forward to avoid ATen addmm, routing through mm + add."""
+    """Intercepts Linear forward to avoid ATen addmm, routing through fused LinearFunction."""
     is_opencl = False
     if isinstance(input, OjasXTensor):
         is_opencl = True
@@ -182,14 +184,9 @@ def _custom_linear_forward(self, input: torch.Tensor) -> torch.Tensor:
         is_opencl = True
 
     if is_opencl:
-        # Route through mm and add
-        wt = torch.ops.aten.t.default(self.weight)
-        out = torch.ops.aten.mm.default(input, wt)
-        if self.bias is not None:
-            # Broadcast/tile bias vector to match out shape [batch_size, out_features]
-            bias_tiled = self.bias.unsqueeze(0).expand(out.shape[0], -1).contiguous()
-            out = torch.ops.aten.add.Tensor(out, bias_tiled)
-        return out
+        from torchcl.autograd import LinearFunction
+        res = LinearFunction.apply(input, self.weight, self.bias)
+        return res
         
     return _original_linear_forward(self, input)
 

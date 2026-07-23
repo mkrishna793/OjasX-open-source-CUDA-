@@ -84,23 +84,21 @@ b_cpu = torch.randn(3, 8)
 a_cl = to_opencl(a_cpu)
 b_cl = to_opencl(b_cpu)
 
-# Map their data_ptr() values in the shadow buffer registry to simulate C++ allocator
-_opencl_buffers[a_cl.data_ptr()] = _opencl_buffers[a_cl._torchcl_id]
-_opencl_buffers[b_cl.data_ptr()] = _opencl_buffers[b_cl._torchcl_id]
-
-# Create transposed view on CPU (so it has stride(0) == 1 and stride(1) == shape[0])
+# Create transposed view on CPU
 b_t = b_cl.t()
-# Since b_t shares the storage of b_cl, its data_ptr() is the same
-assert b_t.data_ptr() == b_cl.data_ptr()
 b_t._torchcl_shape = (b_cpu.shape[1], b_cpu.shape[0])
+b_t._elem._torchcl_shape = (b_cpu.shape[1], b_cpu.shape[0])
 
 # Run cl_mm directly, which should invoke GPU-based transpose on b_t
 out_gpu_sim = cl_mm(a_cl, b_t)
-out_gpu_sim._torchcl_shape = (4, 3)
 
 # Map the returned tensor's data_ptr() to extract it
 out_cpu = to_cpu(out_gpu_sim)
 
+print("  a_cpu:\n", a_cpu)
+print("  b_cpu:\n", b_cpu)
+print("  out_cpu:\n", out_cpu)
+print("  expected:\n", a_cpu @ b_cpu.t())
 check("cl_mm with GPU transposed input", out_cpu, a_cpu @ b_cpu.t())
 
 # ── Summary ──

@@ -60,14 +60,23 @@ class BenchReport:
 
 def time_fn(fn: Callable, warmup: int = 3, iters: int = 20) -> float:
     """Time a callable in milliseconds. Returns median to reduce noise."""
+    def _force_materialize(res):
+        if hasattr(res, "_elem"):
+            res = res._elem
+        if hasattr(torchcl, "is_opencl_tensor") and torchcl.is_opencl_tensor(res):
+            if hasattr(torchcl.api, "materialize_lazy_tensor") and torchcl.api._is_lazy(res):
+                torchcl.api.materialize_lazy_tensor(res)
+
     for _ in range(warmup):
-        fn()
+        res = fn()
+        _force_materialize(res)
     torchcl.synchronize() if hasattr(torchcl, "synchronize") else None
 
     times = []
     for _ in range(iters):
         start = time.perf_counter()
-        fn()
+        res = fn()
+        _force_materialize(res)
         if hasattr(torchcl, "synchronize"):
             torchcl.synchronize()
         times.append((time.perf_counter() - start) * 1000.0)

@@ -27,3 +27,10 @@ Thumbs.db
 # Distribution
 *.whl
 *.tar.gz
+
+# Local Repo Kernel & Scratch
+.repo-kernel/
+tests/debug_test4.py
+tests/test_fix_matmul.py
+*.exe
+

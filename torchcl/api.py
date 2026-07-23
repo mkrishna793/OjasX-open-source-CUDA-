@@ -20,20 +20,21 @@ import numpy as np
 import torch
 
 import weakref
+import threading
 from torchcl.ops.engine import get_engine
 from torchcl.runtime.memory import CLBuffer, get_buffer_pool
 from torchcl.runtime.context import synchronize as _sync
 
 # ── Internal storage: maps tensor data_ptr → CLBuffer ────────────────
-# Since we can't actually allocate on a real custom device without C++,
-# we use a shadow-tensor approach: the "real" data lives in OpenCL buffers,
-# and we keep a CPU-side tensor as a handle/placeholder.
 _opencl_buffers = weakref.WeakValueDictionary()
-_tensor_id_counter = 0
+_buffer_lock = threading.RLock()
 
 
 def _cleanup_buffer(cl_buf: CLBuffer) -> None:
     get_buffer_pool().free(cl_buf)
+
+
+_tensor_id_counter = 0
 
 
 def _next_id() -> int:
@@ -56,123 +57,152 @@ def _get_buf(tensor: torch.Tensor) -> CLBuffer:
     """Get the OpenCL buffer for a TorchCL tensor handle."""
     if hasattr(tensor, "_elem"):
         return _get_buf(tensor._elem)
-    ptr = tensor.data_ptr()
-    if ptr in _opencl_buffers:
-        return _opencl_buffers[ptr]
     tid = getattr(tensor, "_torchcl_id", None)
-    if tid is None:
+    if tid is not None and tid in _opencl_buffers:
+        return _opencl_buffers[tid]
+    ptr = tensor.data_ptr()
+    with _buffer_lock:
+        if ptr in _opencl_buffers:
+            return _opencl_buffers[ptr]
+        try:
+            storage_ptr = tensor.untyped_storage().data_ptr()
+            if storage_ptr in _opencl_buffers:
+                return _opencl_buffers[storage_ptr]
+        except Exception:
+            pass
+        if _is_lazy(tensor):
+            materialize_lazy_tensor(tensor)
+            return _opencl_buffers[tensor._torchcl_id]
         raise ValueError(
             "This tensor is not on the OpenCL device. "
             "Use torchcl.to_opencl(tensor) first."
         )
-    if tid not in _opencl_buffers:
-        if _is_lazy(tensor):
-            materialize_lazy_tensor(tensor)
-        else:
-            raise ValueError(
-                "This tensor is not on the OpenCL device. "
-                "Use torchcl.to_opencl(tensor) first."
-            )
-    return _opencl_buffers[tid]
 
 
 def _is_lazy(tensor: torch.Tensor) -> bool:
+    if hasattr(tensor, "_elem"):
+        return _is_lazy(tensor._elem)
     return getattr(tensor, "_lazy_inputs", None) is not None
 
 
 def _create_lazy_unary(op_name: str, a: torch.Tensor) -> torch.Tensor:
-    shape = _get_shape(a)
-    dtype = _get_dtype(a)
+    a_elem = a._elem if hasattr(a, "_elem") else a
+    shape = _get_shape(a_elem)
+    dtype = _get_dtype(a_elem)
     handle, tid = _make_handle(shape, dtype)
     
-    if _is_lazy(a):
-        handle._lazy_inputs = a._lazy_inputs
-        handle._lazy_op_type = a._lazy_op_type
-        if hasattr(a, "_lazy_binary_op"):
-            handle._lazy_binary_op = a._lazy_binary_op
-        handle._lazy_ops = list(a._lazy_ops) + [op_name]
+    if _is_lazy(a_elem):
+        handle._lazy_inputs = a_elem._lazy_inputs
+        handle._lazy_op_type = a_elem._lazy_op_type
+        if hasattr(a_elem, "_lazy_binary_op"):
+            handle._lazy_binary_op = a_elem._lazy_binary_op
+        handle._lazy_ops = list(a_elem._lazy_ops) + [op_name]
     else:
-        handle._lazy_inputs = [a]
+        handle._lazy_inputs = [a_elem]
         handle._lazy_op_type = "unary"
         handle._lazy_ops = [op_name]
         
-    return handle
+    from torchcl.tensor import OjasXTensor
+    return OjasXTensor(handle)
 
 
 def _create_lazy_binary(op_name: str, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-    if _is_lazy(a):
-        materialize_lazy_tensor(a)
-    if _is_lazy(b):
-        materialize_lazy_tensor(b)
+    a_elem = a._elem if hasattr(a, "_elem") else a
+    b_elem = b._elem if hasattr(b, "_elem") else b
+    
+    if _is_lazy(a_elem):
+        materialize_lazy_tensor(a_elem)
+    if _is_lazy(b_elem):
+        materialize_lazy_tensor(b_elem)
         
-    shape = _get_shape(a)
-    dtype = _get_dtype(a)
+    shape = _get_shape(a_elem)
+    dtype = _get_dtype(a_elem)
     handle, tid = _make_handle(shape, dtype)
     
-    handle._lazy_inputs = [a, b]
+    handle._lazy_inputs = [a_elem, b_elem]
     handle._lazy_op_type = "binary_then_unary"
     handle._lazy_binary_op = op_name
     handle._lazy_ops = []
     
-    return handle
+    from torchcl.tensor import OjasXTensor
+    return OjasXTensor(handle)
 
 
 def materialize_lazy_tensor(tensor: torch.Tensor) -> None:
-    if tensor._torchcl_id in _opencl_buffers:
-        return
+    tensor_elem = tensor._elem if hasattr(tensor, "_elem") else tensor
+    with _buffer_lock:
+        if tensor_elem._torchcl_id in _opencl_buffers:
+            return
 
-    inputs = tensor._lazy_inputs
+    inputs = tensor_elem._lazy_inputs
     for inp in inputs:
         if _is_lazy(inp):
             materialize_lazy_tensor(inp)
 
     engine = get_engine()
-    shape = tensor._torchcl_shape
-    dtype = tensor._torchcl_dtype
+    shape = tensor_elem._torchcl_shape
+    dtype = tensor_elem._torchcl_dtype
     out_buf = engine.allocate_output(shape, dtype)
 
     from torchcl.jit.compiler import get_jit_compiler
     jit = get_jit_compiler()
     n = int(np.prod(shape))
 
-    if tensor._lazy_op_type == "unary":
-        in_buf = _opencl_buffers[inputs[0]._torchcl_id].buffer
-        jit.fuse_elementwise_chain(tensor._lazy_ops, n, [in_buf], out_buf.buffer)
-    elif tensor._lazy_op_type == "binary_then_unary":
-        a_buf = _opencl_buffers[inputs[0]._torchcl_id].buffer
-        b_buf = _opencl_buffers[inputs[1]._torchcl_id].buffer
-        jit.fuse_binary_then_unary(tensor._lazy_binary_op, tensor._lazy_ops, n, a_buf, b_buf, out_buf.buffer)
+    with _buffer_lock:
+        if tensor_elem._lazy_op_type == "unary":
+            in_buf = _opencl_buffers[inputs[0]._torchcl_id].buffer
+            jit.fuse_elementwise_chain(tensor_elem._lazy_ops, n, [in_buf], out_buf.buffer)
+        elif tensor_elem._lazy_op_type == "binary_then_unary":
+            a_buf = _opencl_buffers[inputs[0]._torchcl_id].buffer
+            b_buf = _opencl_buffers[inputs[1]._torchcl_id].buffer
+            jit.fuse_binary_then_unary(tensor_elem._lazy_binary_op, tensor_elem._lazy_ops, n, a_buf, b_buf, out_buf.buffer)
 
-    _opencl_buffers[tensor._torchcl_id] = out_buf
-    weakref.finalize(tensor, _cleanup_buffer, out_buf)
+        _opencl_buffers[tensor_elem._torchcl_id] = out_buf
+    weakref.finalize(tensor_elem, _cleanup_buffer, out_buf)
 
 
 def _get_shape(tensor: torch.Tensor) -> tuple:
-    return getattr(tensor, "_torchcl_shape", tensor.shape)
+    s = getattr(tensor, "_torchcl_shape", None)
+    if s is not None:
+        return s
+    if hasattr(tensor, "_elem"):
+        return _get_shape(tensor._elem)
+    return tuple(tensor.shape)
 
 
 def _get_dtype(tensor: torch.Tensor) -> torch.dtype:
-    return getattr(tensor, "_torchcl_dtype", tensor.dtype)
+    d = getattr(tensor, "_torchcl_dtype", None)
+    if d is not None:
+        return d
+    if hasattr(tensor, "_elem"):
+        return _get_dtype(tensor._elem)
+    return tensor.dtype
 
 
 def _wrap_output(cl_buf: CLBuffer, shape: tuple, dtype: torch.dtype = torch.float32) -> torch.Tensor:
     """Wrap an OpenCL buffer as a TorchCL tensor handle."""
     handle, tid = _make_handle(shape, dtype)
-    _opencl_buffers[tid] = cl_buf
+    with _buffer_lock:
+        _opencl_buffers[tid] = cl_buf
     weakref.finalize(handle, _cleanup_buffer, cl_buf)
-    return handle
+    from torchcl.tensor import OjasXTensor
+    return OjasXTensor(handle)
 
 
 def is_opencl_tensor(tensor: torch.Tensor) -> bool:
     """Check if a tensor is stored on OpenCL."""
+    if tensor is None:
+        return False
     if hasattr(tensor, "_elem"):
         return is_opencl_tensor(tensor._elem)
     if getattr(tensor, "device", None) is not None and tensor.device.type in ("opencl", "privateuseone"):
         return True
-    if tensor.data_ptr() in _opencl_buffers:
-        return True
-    tid = getattr(tensor, "_torchcl_id", None)
-    return tid is not None and (tid in _opencl_buffers or _is_lazy(tensor))
+    with _buffer_lock:
+        if tensor.data_ptr() in _opencl_buffers:
+            return True
+        tid = getattr(tensor, "_torchcl_id", None)
+        return tid is not None and (tid in _opencl_buffers or _is_lazy(tensor))
+
 
 
 # ── Data movement ────────────────────────────────────────────────────
@@ -189,6 +219,8 @@ def to_opencl(tensor: torch.Tensor) -> torch.Tensor:
 
 def to_cpu(tensor: torch.Tensor) -> torch.Tensor:
     """Move an OpenCL tensor back to CPU."""
+    if tensor is None:
+        return None
     if hasattr(tensor, "_elem"):
         return to_cpu(tensor._elem)
     if not is_opencl_tensor(tensor):

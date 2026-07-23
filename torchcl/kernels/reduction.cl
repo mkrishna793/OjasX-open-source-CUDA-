@@ -107,3 +107,37 @@ __kernel void softmax_f32(__global const float* input,
         output[offset + j] /= sum;
     }
 }
+
+__kernel void sum_columns_f32(__global const float* input,
+                              __global float* output,
+                              const int rows,
+                              const int cols) {
+    int col = get_global_id(0);
+    if (col >= cols) return;
+
+    float sum = 0.0f;
+    for (int r = 0; r < rows; r++) {
+        sum += input[r * cols + col];
+    }
+    output[col] = sum;
+}
+
+__kernel void sum_conv2d_bias_f32(__global const float* input,
+                                  __global float* output,
+                                  const int N,
+                                  const int C,
+                                  const int H,
+                                  const int W) {
+    int c = get_global_id(0);
+    if (c >= C) return;
+
+    float sum = 0.0f;
+    int spatial = H * W;
+    for (int n = 0; n < N; n++) {
+        int offset = n * C * spatial + c * spatial;
+        for (int i = 0; i < spatial; i++) {
+            sum += input[offset + i];
+        }
+    }
+    output[c] = sum;
+}
