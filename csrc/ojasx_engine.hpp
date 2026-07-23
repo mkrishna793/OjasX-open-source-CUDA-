@@ -16,6 +16,9 @@
 #include "backends/scheduling_category.hpp"
 #include "backends/vulkan_backend.hpp"
 #include "backends/opencl_backend.hpp"
+#include "backends/micro_optimized_kernels.hpp"
+#include "backends/collective_category.hpp"
+#include "backends/liquid_compute_runtime.hpp"
 
 namespace ojasx {
 
