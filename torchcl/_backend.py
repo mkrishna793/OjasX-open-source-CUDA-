@@ -1,6 +1,7 @@
 """
 torch.compile Backend for OjasX / TorchCL — Captures TorchDynamo FX Graphs,
-performs Polyhedral & JIT Operator Fusion, and executes directly on GPU.
+performs Polyhedral & JIT Operator Fusion, and executes directly on GPU
+with Graph Capture & Replay (CUDA Graphs Parity).
 
 Usage:
     import torch
@@ -17,10 +18,11 @@ import torch
 import torch.fx
 from torch.fx import Interpreter
 import numpy as np
-from typing import Any, List, Dict, Callable
+from typing import Any, List, Dict, Callable, Optional, Tuple
 
 import torchcl
 from torchcl.jit.compiler import get_jit_compiler
+from torchcl.jit.graph_runner import capture_graph, CapturedGraph
 from torchcl.ops.engine import get_engine
 from torchcl.runtime.memory import get_buffer_pool
 from torchcl.api import is_opencl_tensor, to_opencl, to_cpu, _get_buf, _get_shape
@@ -87,14 +89,43 @@ class OjasXFXInterpreter(Interpreter):
 
     def run(self, *args, **kwargs) -> Any:
         res = super().run(*args, **kwargs)
-        # Unwrap result tensors to CPU for the caller if needed
         return torch.utils._pytree.tree_map(lambda x: to_cpu(x) if is_opencl_tensor(x) else x, res)
 
 
+class OjasXCompiledCallable:
+    """Stateful executable wrapper with Graph Capture & Replay acceleration."""
+
+    def __init__(self, gm: torch.fx.GraphModule) -> None:
+        self.interp = OjasXFXInterpreter(gm)
+        self.captured_graph: Optional[CapturedGraph] = None
+        self.cached_output: Any = None
+        self.cached_shapes: Optional[List[Tuple[int, ...]]] = None
+
+    def __call__(self, *args, **kwargs) -> Any:
+        current_shapes = [tuple(a.shape) for a in args if isinstance(a, torch.Tensor)]
+
+        # Fast path: Replay pre-captured execution graph if shapes match
+        if (
+            self.captured_graph is not None
+            and len(self.captured_graph) > 0
+            and self.cached_shapes == current_shapes
+        ):
+            self.captured_graph.replay()
+            return self.cached_output
+
+        # First run / shape changed: capture execution graph
+        with capture_graph("ojasx_fx_captured") as cg:
+            out = self.interp.run(*args, **kwargs)
+
+        self.captured_graph = cg
+        self.cached_output = out
+        self.cached_shapes = current_shapes
+        return out
+
+
 def ojasx_compiler_backend(gm: torch.fx.GraphModule, example_inputs: List[torch.Tensor]) -> Callable:
-    """The torch.compile backend compiler for OjasX."""
-    interp = OjasXFXInterpreter(gm)
-    return interp.run
+    """The torch.compile backend compiler for OjasX with Graph Capture & Replay."""
+    return OjasXCompiledCallable(gm)
 
 
 # ── Register with torch._dynamo ──────────────────────────────────────

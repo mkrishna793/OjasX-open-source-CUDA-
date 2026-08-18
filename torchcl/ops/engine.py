@@ -64,9 +64,9 @@ class OpenCLEngine:
         shape: tuple,
         dtype: torch.dtype = torch.float32,
     ) -> CLBuffer:
-        """Allocate an empty output buffer for a given tensor shape/dtype."""
         np_dtype = _TORCH_TO_NP.get(dtype, np.float32)
-        nbytes = int(np.prod(shape)) * np.dtype(np_dtype).itemsize
+        numel = math.prod(int(d) for d in shape) if shape else 1
+        nbytes = numel * np.dtype(np_dtype).itemsize
         return self._pool.allocate(nbytes, np_dtype, shape)
 
     def free_buffer(self, cl_buf: CLBuffer) -> None:
@@ -74,6 +74,13 @@ class OpenCLEngine:
         self._pool.free(cl_buf)
 
     # ── Kernel launching ─────────────────────────────────────────
+
+    def _enqueue_kernel(self, kernel, queue, global_size, local_size, *args):
+        from torchcl.jit.graph_runner import get_active_capture_graph
+        cg = get_active_capture_graph()
+        if cg is not None:
+            cg.record_kernel_launch(kernel, global_size, local_size, *args)
+        kernel(queue, global_size, local_size, *args)
 
     def _compute_global_size(self, n: int, local_size: int = 256) -> int:
         """Round up n to the nearest multiple of local_size."""
@@ -92,8 +99,8 @@ class OpenCLEngine:
         kernel = self._registry.get_kernel("elementwise.cl", kernel_name)
         global_size = (self._compute_global_size(n),)
         local_size = (min(256, n),) if n >= 256 else None
-        kernel(queue, global_size, local_size,
-               a_buf.buffer, b_buf.buffer, out_buf.buffer, np.int32(n))
+        self._enqueue_kernel(kernel, queue, global_size, local_size,
+                             a_buf.buffer, b_buf.buffer, out_buf.buffer, np.int32(n))
 
     def run_elementwise_unary(
         self,
@@ -107,8 +114,8 @@ class OpenCLEngine:
         kernel = self._registry.get_kernel("elementwise.cl", kernel_name)
         global_size = (self._compute_global_size(n),)
         local_size = (min(256, n),) if n >= 256 else None
-        kernel(queue, global_size, local_size,
-               a_buf.buffer, out_buf.buffer, np.int32(n))
+        self._enqueue_kernel(kernel, queue, global_size, local_size,
+                             a_buf.buffer, out_buf.buffer, np.int32(n))
 
     def run_elementwise_scalar(
         self,
@@ -123,8 +130,8 @@ class OpenCLEngine:
         kernel = self._registry.get_kernel("elementwise.cl", kernel_name)
         global_size = (self._compute_global_size(n),)
         local_size = (min(256, n),) if n >= 256 else None
-        kernel(queue, global_size, local_size,
-               a_buf.buffer, np.float32(scalar), out_buf.buffer, np.int32(n))
+        self._enqueue_kernel(kernel, queue, global_size, local_size,
+                             a_buf.buffer, np.float32(scalar), out_buf.buffer, np.int32(n))
 
     def run_activation(
         self,
@@ -182,9 +189,9 @@ class OpenCLEngine:
             )
             local_size = None
 
-        kernel(queue, global_size, local_size,
-               a_buf.buffer, b_buf.buffer, out_buf.buffer,
-               np.int32(M), np.int32(N), np.int32(K))
+        self._enqueue_kernel(kernel, queue, global_size, local_size,
+                             a_buf.buffer, b_buf.buffer, out_buf.buffer,
+                             np.int32(M), np.int32(N), np.int32(K))
 
     def run_matmul_fp16(
         self,
@@ -233,40 +240,43 @@ class OpenCLEngine:
         out_buf: CLBuffer,
         n: int,
     ) -> None:
-        """Run a reduction kernel (sum, max, min).
-
-        Uses a two-pass approach: first reduce within workgroups,
-        then reduce the workgroup results on CPU (simple and correct).
-        """
+        """Launch reduction kernel on GPU using pure multi-pass tree reduction without CPU roundtrips."""
         queue = get_queue()
         kernel = self._registry.get_kernel("reduction.cl", kernel_name)
 
-        local_size = min(256, n)
-        num_groups = (n + local_size - 1) // local_size
-        global_size = num_groups * local_size
+        if n <= 1:
+            cl.enqueue_copy(queue, out_buf.buffer, a_buf.buffer, byte_count=4)
+            return
 
-        # Allocate partial results buffer
-        partial_buf = self._pool.allocate(num_groups * 4)  # float32 = 4 bytes
+        def _p2_local_size(k: int) -> int:
+            for p in (256, 128, 64, 32, 16, 8, 4, 2):
+                if k >= p:
+                    return p
+            return 1
 
-        kernel(queue, (global_size,), (local_size,),
-               a_buf.buffer, partial_buf.buffer,
-               cl.LocalMemory(local_size * 4),
-               np.int32(n))
+        current_input = a_buf
+        current_n = n
+        temp_buffers: list[CLBuffer] = []
 
-        # Read partial results and finish on CPU
-        partials = self._pool.device_to_host(partial_buf, np.float32, (num_groups,))
-        self._pool.free(partial_buf)
+        while current_n > 1:
+            local_size = _p2_local_size(current_n)
+            num_groups = (current_n + local_size - 1) // local_size
+            global_size = num_groups * local_size
 
-        if kernel_name == "sum_f32":
-            result = np.array([partials.sum()], dtype=np.float32)
-        elif kernel_name == "max_f32":
-            result = np.array([partials.max()], dtype=np.float32)
-        elif kernel_name == "min_f32":
-            result = np.array([partials.min()], dtype=np.float32)
-        else:
-            result = np.array([partials.sum()], dtype=np.float32)
+            target_buf = out_buf if num_groups == 1 else self._pool.allocate(num_groups * 4)
+            if target_buf != out_buf:
+                temp_buffers.append(target_buf)
 
-        self._pool.host_to_device(result, out_buf)
+            kernel(queue, (global_size,), (local_size,),
+                   current_input.buffer, target_buf.buffer,
+                   cl.LocalMemory(local_size * 4),
+                   np.int32(current_n))
+
+            current_input = target_buf
+            current_n = num_groups
+
+        for tb in temp_buffers:
+            self._pool.free(tb)
 
     def run_softmax(
         self,
@@ -459,7 +469,7 @@ class OpenCLEngine:
         pad_h: int,
         pad_w: int,
     ) -> None:
-        """Run direct 3x3 convolution."""
+        """Run direct 3x3 convolution on GPU."""
         queue = get_queue()
         kernel = self._registry.get_kernel("conv.cl", "conv2d_direct_3x3_f32")
         

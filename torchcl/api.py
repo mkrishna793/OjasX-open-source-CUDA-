@@ -15,7 +15,7 @@ Usage:
 from __future__ import annotations
 
 from typing import Any
-
+import math
 import numpy as np
 import torch
 
@@ -516,23 +516,50 @@ def min_(a: torch.Tensor) -> torch.Tensor:
 
 def layer_norm(
     a: torch.Tensor,
-    weight: torch.Tensor,
-    bias: torch.Tensor,
-    normalized_shape: int,
+    normalized_shape: int | Sequence[int] | torch.Tensor,
+    weight: Optional[torch.Tensor] = None,
+    bias: Optional[torch.Tensor] = None,
     eps: float = 1e-5,
 ) -> torch.Tensor:
-    """Layer normalization on OpenCL."""
+    """Layer normalization on OpenCL (supports both PyTorch and TorchCL arg orders)."""
     engine = get_engine()
     shape = _get_shape(a)
-    N = normalized_shape
-    M = int(np.prod(shape)) // N
+    
+    # Handle legacy argument order (a, weight, bias, normalized_shape)
+    if isinstance(normalized_shape, torch.Tensor) and (isinstance(bias, (int, tuple, list)) or bias is None):
+        w = normalized_shape
+        b = weight
+        norm_shape = bias if bias is not None else shape[-1]
+    else:
+        norm_shape = normalized_shape
+        w = weight
+        b = bias
+
+    if isinstance(norm_shape, (tuple, list, torch.Size)):
+        N = math.prod(int(d) for d in norm_shape)
+    else:
+        N = int(norm_shape)
+
+    total_numel = math.prod(int(d) for d in shape)
+    M = total_numel // N
 
     out_buf = engine.allocate_output(shape)
     mean_buf = engine.allocate_output((M,))
     rstd_buf = engine.allocate_output((M,))
 
+    w_buf = _get_buf(w) if w is not None else None
+    b_buf = _get_buf(b) if b is not None else None
+
+    # Allocate dummy ones/zeros if weight/bias not provided
+    if w_buf is None:
+        w_buf = get_buffer_pool().allocate(N * 4)
+        engine.run_fill(w_buf, 1.0, N)
+    if b_buf is None:
+        b_buf = get_buffer_pool().allocate(N * 4)
+        engine.run_fill(b_buf, 0.0, N)
+
     engine.run_layer_norm(
-        _get_buf(a), _get_buf(weight), _get_buf(bias),
+        _get_buf(a), w_buf, b_buf,
         out_buf, mean_buf, rstd_buf,
         M, N, eps,
     )

@@ -100,6 +100,10 @@ def init_opencl(
     _initialized = True
 
 
+import threading
+_thread_local = threading.local()
+
+
 def get_context() -> cl.Context:
     """Return the active OpenCL context. Initializes if needed."""
     _ensure_initialized()
@@ -107,7 +111,19 @@ def get_context() -> cl.Context:
 
 
 def get_queue() -> cl.CommandQueue:
-    """Return the active command queue. Initializes if needed."""
+    """Return the active command queue (thread-local or default). Initializes if needed."""
+    _ensure_initialized()
+    q = getattr(_thread_local, "current_queue", None)
+    if q is not None:
+        return q
+    return _queue  # type: ignore[return-value]
+
+
+def _set_current_queue(q: cl.CommandQueue | None) -> None:
+    _thread_local.current_queue = q
+
+
+def _get_default_queue() -> cl.CommandQueue:
     _ensure_initialized()
     return _queue  # type: ignore[return-value]
 
@@ -127,7 +143,7 @@ def get_device_info() -> dict:
 def synchronize() -> None:
     """Block until all enqueued commands on the device finish."""
     _ensure_initialized()
-    _queue.finish()  # type: ignore[union-attr]
+    get_queue().finish()
 
 
 def is_available() -> bool:

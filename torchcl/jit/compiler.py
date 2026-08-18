@@ -88,6 +88,11 @@ class JITCompiler:
         global_size = (self._round_up(n, workgroup),)
         local_size = (workgroup,)
 
+        from torchcl.jit.graph_runner import get_active_capture_graph
+        cg = get_active_capture_graph()
+        if cg is not None:
+            cg.record_kernel_launch(kernel, global_size, local_size, input_buffers[0], output_buffer, np.int32(n))
+
         kernel(queue, global_size, local_size,
                input_buffers[0], output_buffer, np.int32(n))
 
@@ -118,6 +123,11 @@ class JITCompiler:
         workgroup = self._tuner.optimal_workgroup_1d(n)
         global_size = (self._round_up(n, workgroup),)
         local_size = (workgroup,)
+
+        from torchcl.jit.graph_runner import get_active_capture_graph
+        cg = get_active_capture_graph()
+        if cg is not None:
+            cg.record_kernel_launch(kernel, global_size, local_size, a_buf, b_buf, out_buf, np.int32(n))
 
         kernel(queue, global_size, local_size,
                a_buf, b_buf, out_buf, np.int32(n))

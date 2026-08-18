@@ -303,3 +303,109 @@ if my_lib is not None:
         return out
 
     my_lib.impl("t", cl_t)
+
+    # Reductions: sum, mean, amax, amin
+    def cl_sum(self: torch.Tensor, dim: Optional[Sequence[int]] = None, keepdim: bool = False, dtype: Optional[torch.dtype] = None) -> torch.Tensor:
+        engine = get_engine()
+        shape = _get_shape(self)
+        n = int(np.prod(shape))
+        out, out_buf = _allocate_tensor_output((1,) if keepdim else (), self.dtype if dtype is None else dtype)
+        in_buf = _get_buf(self)
+        engine.run_reduction("sum_f32", in_buf, out_buf, n)
+        return out
+
+    my_lib.impl("sum", cl_sum)
+    my_lib.impl("sum.dim_IntList", cl_sum)
+
+    def cl_mean(self: torch.Tensor, dim: Optional[Sequence[int]] = None, keepdim: bool = False, dtype: Optional[torch.dtype] = None) -> torch.Tensor:
+        s = cl_sum(self, dim, keepdim, dtype)
+        n = float(np.prod(_get_shape(self)))
+        return s / n
+
+    my_lib.impl("mean", cl_mean)
+    my_lib.impl("mean.dim_IntList", cl_mean)
+
+    def cl_amax(self: torch.Tensor, dim: Optional[Sequence[int]] = None, keepdim: bool = False) -> torch.Tensor:
+        engine = get_engine()
+        shape = _get_shape(self)
+        n = int(np.prod(shape))
+        out, out_buf = _allocate_tensor_output((1,) if keepdim else (), self.dtype)
+        in_buf = _get_buf(self)
+        engine.run_reduction("max_f32", in_buf, out_buf, n)
+        return out
+
+    my_lib.impl("amax", cl_amax)
+
+    def cl_amin(self: torch.Tensor, dim: Optional[Sequence[int]] = None, keepdim: bool = False) -> torch.Tensor:
+        engine = get_engine()
+        shape = _get_shape(self)
+        n = int(np.prod(shape))
+        out, out_buf = _allocate_tensor_output((1,) if keepdim else (), self.dtype)
+        in_buf = _get_buf(self)
+        engine.run_reduction("min_f32", in_buf, out_buf, n)
+        return out
+
+    my_lib.impl("amin", cl_amin)
+
+    # Softmax
+    def cl_softmax(self: torch.Tensor, dim: int = -1, half_to_float: bool = False) -> torch.Tensor:
+        engine = get_engine()
+        shape = _get_shape(self)
+        cols = shape[-1]
+        rows = int(np.prod(shape[:-1])) if len(shape) > 1 else 1
+        out, out_buf = _allocate_tensor_output(shape, self.dtype)
+        in_buf = _get_buf(self)
+        engine.run_softmax(in_buf, out_buf, rows, cols)
+        return out
+
+    my_lib.impl("_softmax", cl_softmax)
+
+    # Clone
+    def cl_clone(self: torch.Tensor, memory_format: Optional[Any] = None) -> torch.Tensor:
+        shape = _get_shape(self)
+        out, out_buf = _allocate_tensor_output(shape, self.dtype)
+        in_buf = _get_buf(self)
+        queue = get_queue()
+        cl.enqueue_copy(queue, out_buf.buffer, in_buf.buffer, byte_count=out_buf.nbytes)
+        return out
+
+    my_lib.impl("clone", cl_clone)
+
+    # Convolution
+    def cl_convolution(
+        input: torch.Tensor,
+        weight: torch.Tensor,
+        bias: Optional[torch.Tensor],
+        stride: Sequence[int],
+        padding: Sequence[int],
+        dilation: Sequence[int],
+        transposed: bool,
+        output_padding: Sequence[int],
+        groups: int,
+    ) -> torch.Tensor:
+        engine = get_engine()
+        in_shape = _get_shape(input)
+        w_shape = _get_shape(weight)
+        N, C_in, H, W = in_shape[0], in_shape[1], in_shape[2], in_shape[3]
+        C_out = w_shape[0]
+        kH, kW = w_shape[2], w_shape[3]
+        sH, sW = stride[0], stride[1] if len(stride) > 1 else stride[0]
+        pH, pW = padding[0], padding[1] if len(padding) > 1 else padding[0]
+
+        H_out = (H + 2 * pH - kH) // sH + 1
+        W_out = (W + 2 * pW - kW) // sW + 1
+        out_shape = (N, C_out, H_out, W_out)
+        out, out_buf = _allocate_tensor_output(out_shape, input.dtype)
+
+        in_buf = _get_buf(input)
+        w_buf = _get_buf(weight)
+        b_buf = _get_buf(bias) if bias is not None else None
+
+        if kH == 3 and kW == 3:
+            engine.run_conv2d_direct(in_buf, w_buf, b_buf, out_buf, N, C_in, C_out, H, W, H_out, W_out, sH, sW, pH, pW)
+        else:
+            engine.run_conv2d_im2col(in_buf, w_buf, b_buf, out_buf, N, C_in, C_out, H, W, kH, kW, sH, sW, pH, pW, H_out, W_out)
+        return out
+
+    my_lib.impl("convolution", cl_convolution)
+

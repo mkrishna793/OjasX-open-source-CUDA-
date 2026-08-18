@@ -30,8 +30,18 @@ __author__ = "OjasX Contributors"
 from torchcl.runtime.context import (
     init_opencl,
     get_device_info,
-    is_available,
+    get_context,
+    get_queue,
+    get_device,
     synchronize,
+    is_available,
+)
+from torchcl.runtime.stream import (
+    Stream,
+    Event,
+    stream,
+    current_stream,
+    default_stream,
 )
 
 # Public API — tensor operations
@@ -131,5 +141,7 @@ __all__ = [
     "layer_norm", "rms_norm",
     # LLM & Loss
     "cross_entropy_loss", "mse_loss", "fused_attention", "rope", "swiglu",
+    # Streams & Events
+    "Stream", "Event", "stream", "current_stream", "default_stream",
 ]
 
