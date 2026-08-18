@@ -46,8 +46,79 @@ class KernelConfig:
         return f"KernelConfig(wg={self.workgroup_size}, tile={self.tile_size}, strat={self.strategy}, prec={self.precision})"
 
 
+class MorphismCost:
+    """Python reflection of C++ MorphismCost Monoid."""
+    def __init__(
+        self,
+        memory_bytes: int = 0,
+        flops: int = 0,
+        energy_joules: float = 0.0,
+        bandwidth_gbps: float = 0.0,
+        latency_us: float = 0.0,
+        thermal_resistance: float = 0.25,
+    ) -> None:
+        self.memory_bytes = memory_bytes
+        self.flops = flops
+        self.energy_joules = energy_joules
+        self.bandwidth_gbps = bandwidth_gbps
+        self.latency_us = latency_us
+        self.thermal_resistance = thermal_resistance
+
+    def __add__(self, other: MorphismCost) -> MorphismCost:
+        return MorphismCost(
+            memory_bytes=self.memory_bytes + other.memory_bytes,
+            flops=self.flops + other.flops,
+            energy_joules=self.energy_joules + other.energy_joules,
+            bandwidth_gbps=max(self.bandwidth_gbps, other.bandwidth_gbps),
+            latency_us=self.latency_us + other.latency_us,
+            thermal_resistance=max(self.thermal_resistance, other.thermal_resistance),
+        )
+
+    def power_watts(self) -> float:
+        if self.latency_us <= 0.0:
+            return 0.0
+        return self.energy_joules / (self.latency_us * 1e-6)
+
+    def delta_temperature_c(self) -> float:
+        return self.power_watts() * self.thermal_resistance
+
+    def score(self, w_latency: float = 1.0, w_energy: float = 0.5, w_mem: float = 0.001) -> float:
+        return (self.latency_us * w_latency) + (self.energy_joules * w_energy) + (self.memory_bytes * w_mem)
+
+    def is_pareto_dominant_over(self, other: MorphismCost) -> bool:
+        better_or_equal = (
+            self.energy_joules <= other.energy_joules
+            and self.latency_us <= other.latency_us
+            and self.memory_bytes <= other.memory_bytes
+        )
+        strictly_better = (
+            self.energy_joules < other.energy_joules
+            or self.latency_us < other.latency_us
+            or self.memory_bytes < other.memory_bytes
+        )
+        return better_or_equal and strictly_better
+
+
 class CostModel:
     """Lightweight analytical cost model with online regression capabilities."""
+
+    @staticmethod
+    def morphism_cost(op: str, *dims: int) -> MorphismCost:
+        """Estimate 5D morphism cost for an operation."""
+        if op == "gemm" and len(dims) >= 3:
+            M, N, K = dims[0], dims[1], dims[2]
+            flops = 2 * M * N * K
+            mem = (M * K + K * N + M * N) * 4
+            latency_us = (flops / 1e9) * 20.0  # Approx 50 GFLOPS on iGPU
+            energy_j = (latency_us * 1e-6) * 15.0  # 15W TDP
+            return MorphismCost(memory_bytes=mem, flops=flops, energy_joules=energy_j, bandwidth_gbps=68.0, latency_us=latency_us)
+        else:
+            numel = dims[0] if dims else 1024
+            flops = numel
+            mem = numel * 8
+            latency_us = (numel / 1e6) * 5.0
+            energy_j = (latency_us * 1e-6) * 10.0
+            return MorphismCost(memory_bytes=mem, flops=flops, energy_joules=energy_j, bandwidth_gbps=68.0, latency_us=latency_us)
 
     def __init__(self) -> None:
         # Weights for compute cost, memory cost, and launch overhead

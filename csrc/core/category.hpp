@@ -22,7 +22,15 @@ concept Morphism = Object<Domain> && Object<Codomain> && requires(Morph m, const
 };
 
 // ============================================================================
-// 2. IDENTITY MORPHISM (id_A : A -> A)
+// 2. MONOIDAL UNIT OBJECT (I)
+// ============================================================================
+struct MonoidalUnit {
+    using meaning = void;
+    static constexpr size_t size() noexcept { return 0; }
+};
+
+// ============================================================================
+// 3. IDENTITY MORPHISM (id_A : A -> A)
 // ============================================================================
 template <Object A>
 struct IdentityMorphism {
@@ -39,7 +47,42 @@ struct IdentityMorphism {
 };
 
 // ============================================================================
-// 3. MORPHISM COMPOSITION (g ∘ f : Domain(f) -> Codomain(g))
+// 4. DAGGER ADJOINT MORPHISMS (f† : Codomain -> Domain)
+// ============================================================================
+template <typename Morph>
+struct Dagger {
+    Morph forward_morph;
+
+    using Domain   = typename Morph::Codomain;
+    using Codomain = typename Morph::Domain;
+
+    template <typename Input>
+    constexpr auto operator()(Input&& input) const {
+        if constexpr (requires { forward_morph.adjoint(std::forward<Input>(input)); }) {
+            return forward_morph.adjoint(std::forward<Input>(input));
+        } else {
+            return Codomain{};
+        }
+    }
+
+    /// Involution Axiom: (f†)† == f
+    constexpr Morph dagger() const noexcept {
+        return forward_morph;
+    }
+};
+
+/// Unary Operator ~ for Dagger Adjoint: ~f == f†
+template <typename Morph>
+constexpr auto operator~(Morph m) {
+    if constexpr (requires { m.dagger(); }) {
+        return m.dagger();
+    } else {
+        return Dagger<Morph>{m};
+    }
+}
+
+// ============================================================================
+// 5. MORPHISM COMPOSITION (g ∘ f : Domain(f) -> Codomain(g))
 // ============================================================================
 template <typename MorphF, typename MorphG>
 struct Composition {
@@ -57,6 +100,11 @@ struct Composition {
     constexpr auto operator()(Input&& input) const {
         return g(f(std::forward<Input>(input)));
     }
+
+    /// Dagger Functoriality Axiom: (g ∘ f)† == (f† ∘ g†)
+    constexpr auto dagger() const {
+        return Composition<Dagger<MorphG>, Dagger<MorphF>>{~g, ~f};
+    }
 };
 
 /// Operator Overload for Morphism Composition: g * f  ==  (g ∘ f)
@@ -66,7 +114,7 @@ constexpr auto operator*(MorphG g, MorphF f) {
 }
 
 // ============================================================================
-// 4. MONOIDAL TENSOR PRODUCT (f ⊗ g : (DomF ⊗ DomG) -> (CodomF ⊗ CodomG))
+// 6. MONOIDAL TENSOR PRODUCT (f ⊗ g : (DomF ⊗ DomG) -> (CodomF ⊗ CodomG))
 // ============================================================================
 template <typename MorphF, typename MorphG>
 struct TensorProduct {
@@ -79,6 +127,11 @@ struct TensorProduct {
     template <typename InputA, typename InputB>
     constexpr auto operator()(const std::pair<InputA, InputB>& input) const {
         return std::make_pair(f(input.first), g(input.second));
+    }
+
+    /// Monoidal Dagger Axiom: (f ⊗ g)† == (f† ⊗ g†)
+    constexpr auto dagger() const {
+        return TensorProduct<Dagger<MorphF>, Dagger<MorphG>>{~f, ~g};
     }
 };
 

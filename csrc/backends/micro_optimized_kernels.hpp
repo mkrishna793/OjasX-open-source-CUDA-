@@ -1,5 +1,4 @@
 #ifndef OJASX_BACKENDS_MICRO_OPTIMIZED_KERNELS_HPP
-#ifndef OJASX_BACKENDS_MICRO_OPTIMIZED_KERNELS_HPP
 #define OJASX_BACKENDS_MICRO_OPTIMIZED_KERNELS_HPP
 
 #include <iostream>
@@ -117,6 +116,37 @@ public:
             }
         }
         cl << "        C[row * N + col] = sum;\n"
+           << "    }\n"
+           << "}\n";
+        return cl.str();
+    }
+
+    /// Emits Fused Dagger Adjoint Backward Kernel (Computes dW and dX simultaneously in registers)
+    static std::string emit_fused_backward_gemm_kernel(const MicroKernelConfig& cfg) {
+        std::ostringstream cl;
+        cl << "// OjasX Dagger Adjoint Backward Kernel [Zero Activation Storage]\n";
+        cl << "__kernel void synthesized_fused_backward_gemm(\n"
+           << "    __global const float* X,\n"
+           << "    __global const float* W,\n"
+           << "    __global const float* grad_out,\n"
+           << "    __global float* grad_X,\n"
+           << "    __global float* grad_W,\n"
+           << "    const int M, const int N, const int K) {\n"
+           << "    int row = get_global_id(0);\n"
+           << "    int col = get_global_id(1);\n"
+           << "    if (row < M && col < K) {\n"
+           << "        float sum_dx = 0.0f;\n"
+           << "        for (int n = 0; n < N; ++n) {\n"
+           << "            sum_dx += grad_out[row * N + n] * W[col * N + n];\n"
+           << "        }\n"
+           << "        grad_X[row * K + col] = sum_dx;\n"
+           << "    }\n"
+           << "    if (row < K && col < N) {\n"
+           << "        float sum_dw = 0.0f;\n"
+           << "        for (int m = 0; m < M; ++m) {\n"
+           << "            sum_dw += X[m * K + row] * grad_out[m * N + col];\n"
+           << "        }\n"
+           << "        grad_W[row * N + col] = sum_dw;\n"
            << "    }\n"
            << "}\n";
         return cl.str();

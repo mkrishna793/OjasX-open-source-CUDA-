@@ -1,5 +1,4 @@
 #ifndef OJASX_BACKENDS_LIQUID_COMPUTE_RUNTIME_HPP
-#ifndef OJASX_BACKENDS_LIQUID_COMPUTE_RUNTIME_HPP
 #define OJASX_BACKENDS_LIQUID_COMPUTE_RUNTIME_HPP
 
 #include <iostream>
@@ -8,8 +7,8 @@
 #include <memory>
 #include <chrono>
 #include <algorithm>
-#include "csrc/semantics/cost_monoid.hpp"
-#include "csrc/backends/scheduling_category.hpp"
+#include "../semantics/cost_monoid.hpp"
+#include "scheduling_category.hpp"
 
 namespace ojasx::backends {
 
@@ -69,11 +68,8 @@ public:
         std::vector<LiquidWorkChunk> chunks;
 
         std::size_t num_devices = devices_.size();
+        if (num_devices == 0) return chunks;
         std::size_t elements_per_chunk = total_elements / num_devices;
-
-        std::cout << "  [Liquid Compute Runtime] Fluidly partition " << total_elements
-                  << " elements (" << (total_bytes / (1024 * 1024)) << " MB) across "
-                  << num_devices << " devices:\n";
 
         for (std::size_t i = 0; i < num_devices; ++i) {
             std::size_t chunk_elems = (i == num_devices - 1)
@@ -83,13 +79,9 @@ public:
             double vram_headroom = telemetry_[i].vram_total_mb - telemetry_[i].vram_used_mb;
             bool force_migrate = (vram_headroom < 500.0 || telemetry_[i].gpu_utilization_pct > 90.0);
 
-            uint32_t actual_target = i;
+            uint32_t actual_target = static_cast<uint32_t>(i);
             if (force_migrate) {
-                // Liquid Compute Fluid Overflow: Shift chunk to device with highest headroom
                 actual_target = 0; // Fallback to unified system/iGPU RAM pool
-                std::cout << "    [Liquid Overflow WARNING] Device #" << i
-                          << " headroom critical! Fluidly re-routing Chunk #" << i
-                          << " -> Device #" << actual_target << "\n";
             }
 
             chunks.push_back(LiquidWorkChunk{
@@ -99,26 +91,9 @@ public:
                 .target_device_id = actual_target,
                 .is_migrating = force_migrate
             });
-
-            std::cout << "    - Chunk #" << i << ": " << chunk_elems << " elems ("
-                      << (chunk_elems * element_size_bytes / (1024 * 1024)) << " MB) -> "
-                      << devices_[actual_target].device_name << "\n";
         }
 
         return chunks;
-    }
-
-    /// Simulate real-time dynamic fluid re-balancing under thermal/memory pressure
-    void trigger_thermal_rebalance(uint32_t congested_device_id) {
-        for (auto& snap : telemetry_) {
-            if (snap.device_id == congested_device_id) {
-                snap.temperature_celsius = 88.5; // High thermal pressure
-                snap.gpu_utilization_pct = 98.0;
-                std::cout << "  [Liquid Compute Runtime] Thermal alert on Device #"
-                          << congested_device_id << " (" << snap.device_name << ")!"
-                          << " Fluidly throttling workload & re-routing active morphisms...\n";
-            }
-        }
     }
 };
 
