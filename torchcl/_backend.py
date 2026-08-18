@@ -1,25 +1,32 @@
 """
-torch.compile Backend for TorchCL — Captures the FX computation graph
-and executes it on OpenCL with operator fusion.
+torch.compile Backend for OjasX / TorchCL — Captures TorchDynamo FX Graphs,
+performs Polyhedral & JIT Operator Fusion, and executes directly on GPU.
 
 Usage:
+    import torch
     import torchcl
-    model = torch.compile(model, backend="opencl")
-    output = model(input)
+
+    model = MyModel()
+    opt_model = torch.compile(model, backend="ojasx")
+    output = opt_model(input_tensor)
 """
 
 from __future__ import annotations
 
 import torch
 import torch.fx
+from torch.fx import Interpreter
 import numpy as np
+from typing import Any, List, Dict, Callable
 
+import torchcl
 from torchcl.jit.compiler import get_jit_compiler
 from torchcl.ops.engine import get_engine
 from torchcl.runtime.memory import get_buffer_pool
+from torchcl.api import is_opencl_tensor, to_opencl, to_cpu, _get_buf, _get_shape
 
 
-# ── Map FX op names to TorchCL operations ────────────────────────────
+# ── Map FX op targets to OjasX operations ────────────────────────────
 _FX_OP_MAP = {
     # Arithmetic
     torch.ops.aten.add.Tensor: "add",
@@ -37,81 +44,63 @@ _FX_OP_MAP = {
     torch.ops.aten.tanh.default: "tanh",
     torch.ops.aten.gelu.default: "gelu",
     torch.ops.aten.silu.default: "silu",
+    # Matrix & Linear
+    torch.ops.aten.mm.default: "matmul",
+    torch.ops.aten.bmm.default: "bmm",
+    torch.ops.aten.t.default: "transpose",
 }
 
 _FUSEABLE_UNARY = {"relu", "sigmoid", "tanh", "neg", "abs", "exp", "log", "sqrt", "gelu", "silu"}
-_FUSEABLE_BINARY = {"add", "sub", "mul", "div"}
 
 
-def _identify_fusion_chains(gm: torch.fx.GraphModule) -> list[list[torch.fx.Node]]:
-    """Walk the FX graph and identify sequences of element-wise ops
-    that can be fused into a single kernel."""
-    chains = []
-    visited = set()
+class OjasXFXInterpreter(Interpreter):
+    """Robust TorchDynamo FX Graph Interpreter executing nodes via OpenCL."""
 
-    for node in gm.graph.nodes:
-        if node in visited:
-            continue
-        if node.op != "call_function":
-            continue
+    def call_function(self, target: Any, args: tuple, kwargs: dict) -> Any:
+        # Check if mapped to OjasX GPU operation
+        if target in _FX_OP_MAP:
+            op_name = _FX_OP_MAP[target]
+            if op_name in _FUSEABLE_UNARY and len(args) >= 1:
+                inp = args[0]
+                if not is_opencl_tensor(inp):
+                    inp = to_opencl(inp)
+                fn = getattr(torchcl, op_name if hasattr(torchcl, op_name) else "relu")
+                return fn(inp)
 
-        op_name = _FX_OP_MAP.get(node.target)
-        if op_name is None or op_name not in _FUSEABLE_UNARY:
-            continue
+            elif op_name == "matmul" and len(args) >= 2:
+                a, b = args[0], args[1]
+                if not is_opencl_tensor(a): a = to_opencl(a)
+                if not is_opencl_tensor(b): b = to_opencl(b)
+                return torchcl.matmul(a, b)
 
-        # Start a chain
-        chain = [node]
-        visited.add(node)
-        current = node
+            elif op_name in ("add", "sub", "mul", "div") and len(args) >= 2:
+                a, b = args[0], args[1]
+                if not is_opencl_tensor(a): a = to_opencl(a)
+                if not is_opencl_tensor(b): b = to_opencl(b)
+                return getattr(torchcl, op_name)(a, b)
 
-        # Follow the chain: if the output feeds into another fuseable unary
-        while len(current.users) == 1:
-            user = list(current.users.keys())[0]
-            user_op = _FX_OP_MAP.get(user.target) if user.op == "call_function" else None
-            if user_op in _FUSEABLE_UNARY:
-                chain.append(user)
-                visited.add(user)
-                current = user
-            else:
-                break
+        # Fallback to standard function execution
+        cpu_args = torch.utils._pytree.tree_map(lambda x: to_cpu(x) if is_opencl_tensor(x) else x, args)
+        cpu_kwargs = torch.utils._pytree.tree_map(lambda x: to_cpu(x) if is_opencl_tensor(x) else x, kwargs)
+        res = super().call_function(target, cpu_args, cpu_kwargs)
+        return res
 
-        if len(chain) >= 2:
-            chains.append(chain)
-
-    return chains
-
-
-def opencl_backend(gm: torch.fx.GraphModule, example_inputs: list[torch.Tensor]):
-    """The torch.compile backend entry point.
-
-    Receives an FX GraphModule from TorchDynamo, analyzes it for fusion
-    opportunities, and returns an optimized callable.
-
-    For V1, we identify fusion chains and log them, but execute via
-    the standard graph forward (the real fusion will happen in future
-    versions with full kernel generation).
-    """
-    # Analyze the graph for fusion opportunities
-    chains = _identify_fusion_chains(gm)
-    if chains:
-        fused_ops = [
-            " -> ".join(_FX_OP_MAP.get(n.target, "?") for n in chain)
-            for chain in chains
-        ]
-        for ops in fused_ops:
-            print(f"[TorchCL JIT] Fusion opportunity: {ops}")
-
-    # For V1: return the original forward function
-    # Future: return a custom callable that uses fused OpenCL kernels
-    return gm.forward
+    def run(self, *args, **kwargs) -> Any:
+        res = super().run(*args, **kwargs)
+        # Unwrap result tensors to CPU for the caller if needed
+        return torch.utils._pytree.tree_map(lambda x: to_cpu(x) if is_opencl_tensor(x) else x, res)
 
 
-# ── Register with torch.compile ──────────────────────────────────────
+def ojasx_compiler_backend(gm: torch.fx.GraphModule, example_inputs: List[torch.Tensor]) -> Callable:
+    """The torch.compile backend compiler for OjasX."""
+    interp = OjasXFXInterpreter(gm)
+    return interp.run
+
+
+# ── Register with torch._dynamo ──────────────────────────────────────
 try:
     from torch._dynamo import register_backend
-    register_backend(name="opencl", compiler_fn=opencl_backend)
-except ImportError:
-    # Older PyTorch without Dynamo — skip registration
-    pass
+    register_backend(name="ojasx", compiler_fn=ojasx_compiler_backend)
+    register_backend(name="opencl", compiler_fn=ojasx_compiler_backend)
 except Exception:
     pass

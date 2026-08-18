@@ -78,6 +78,8 @@ from torchcl.api import (
     cross_entropy_loss,
     mse_loss,
     fused_attention,
+    rope,
+    swiglu,
 )
 
 # Auto-initialize on import
@@ -100,6 +102,12 @@ try:
 except Exception as e:
     print(f"[TorchCL] V3 Native Integration Failed: {e}")
 
+# Register torch.compile Dynamo backends
+try:
+    import torchcl._backend
+except Exception as e:
+    pass
+
 __all__ = [
     # Info
     "get_device_info",
@@ -121,6 +129,7 @@ __all__ = [
     "sum_", "mean", "max_", "min_",
     # Normalization
     "layer_norm", "rms_norm",
-    # Loss
-    "cross_entropy_loss", "mse_loss", "fused_attention",
+    # LLM & Loss
+    "cross_entropy_loss", "mse_loss", "fused_attention", "rope", "swiglu",
 ]
+

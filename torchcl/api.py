@@ -189,16 +189,16 @@ def _wrap_output(cl_buf: CLBuffer, shape: tuple, dtype: torch.dtype = torch.floa
     return OjasXTensor(handle)
 
 
-def is_opencl_tensor(tensor: torch.Tensor) -> bool:
+def is_opencl_tensor(tensor: Any) -> bool:
     """Check if a tensor is stored on OpenCL."""
-    if tensor is None:
+    if tensor is None or not isinstance(tensor, torch.Tensor):
         return False
     if hasattr(tensor, "_elem"):
         return is_opencl_tensor(tensor._elem)
-    if getattr(tensor, "device", None) is not None and tensor.device.type in ("opencl", "privateuseone"):
+    if getattr(tensor, "device", None) is not None and getattr(tensor.device, "type", None) in ("opencl", "privateuseone", "ojasx"):
         return True
     with _buffer_lock:
-        if tensor.data_ptr() in _opencl_buffers:
+        if hasattr(tensor, "data_ptr") and tensor.data_ptr() in _opencl_buffers:
             return True
         tid = getattr(tensor, "_torchcl_id", None)
         return tid is not None and (tid in _opencl_buffers or _is_lazy(tensor))
@@ -626,6 +626,7 @@ def fused_attention(
     k: torch.Tensor,
     v: torch.Tensor,
     scale: float | None = None,
+    is_causal: bool = False,
 ) -> torch.Tensor:
     """Compute fused scaled dot-product attention on OpenCL.
 
@@ -646,6 +647,36 @@ def fused_attention(
     out_buf = engine.allocate_output((B, H, M, D))
     engine.run_fused_attention(
         _get_buf(q), _get_buf(k), _get_buf(v), out_buf,
-        B, H, M, N, D, scale
+        B, H, M, N, D, scale, is_causal=is_causal
     )
     return _wrap_output(out_buf, (B, H, M, D))
+
+
+def rope(
+    x: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+) -> torch.Tensor:
+    """Apply in-place Rotary Positional Embeddings (RoPE) to x [B, H, SeqLen, D]."""
+    engine = get_engine()
+    x_shape = _get_shape(x)
+    B, H, SeqLen, D = x_shape
+    half_dim = D // 2
+    total_tokens = B * H * SeqLen
+
+    engine.run_rope(_get_buf(x), _get_buf(cos), _get_buf(sin), total_tokens, half_dim)
+    return x
+
+
+def swiglu(
+    gate: torch.Tensor,
+    up: torch.Tensor,
+) -> torch.Tensor:
+    """Compute fused SwiGLU: out = SiLU(gate) * up."""
+    engine = get_engine()
+    shape = _get_shape(gate)
+    n = int(np.prod(shape))
+    out_buf = engine.allocate_output(shape)
+    engine.run_swiglu(_get_buf(gate), _get_buf(up), out_buf, n)
+    return _wrap_output(out_buf, shape)
+

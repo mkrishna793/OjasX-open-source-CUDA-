@@ -714,16 +714,53 @@ class OpenCLEngine:
         Out: CLBuffer,
         B: int, H: int, M: int, N: int, D: int,
         scale: float,
+        is_causal: bool = False,
     ) -> None:
         """Run the fused scaled dot-product attention kernel."""
         queue = get_queue()
-        kernel = self._registry.get_kernel("flash_attention.cl", "flash_attention_f32")
+        kernel_name = "flash_attention_causal_f32" if is_causal else "flash_attention_f32"
+        kernel = self._registry.get_kernel("flash_attention.cl", kernel_name)
         global_size = (B * H * M * 256,)
         local_size = (256,)
         kernel(queue, global_size, local_size,
                Q.buffer, K.buffer, V.buffer, Out.buffer,
                np.int32(B), np.int32(H), np.int32(M), np.int32(N), np.int32(D),
                np.float32(scale))
+
+    def run_rope(
+        self,
+        X_buf: CLBuffer,
+        cos_buf: CLBuffer,
+        sin_buf: CLBuffer,
+        total_tokens: int,
+        half_dim: int,
+    ) -> None:
+        """Apply in-place Rotary Positional Embeddings (RoPE)."""
+        queue = get_queue()
+        kernel = self._registry.get_kernel("flash_attention.cl", "rope_f32")
+        global_size = (
+            self._compute_global_size(total_tokens, 16),
+            self._compute_global_size(half_dim, 16),
+        )
+        local_size = None
+        kernel(queue, global_size, local_size,
+               X_buf.buffer, cos_buf.buffer, sin_buf.buffer,
+               np.int32(total_tokens), np.int32(half_dim))
+
+    def run_swiglu(
+        self,
+        gate_buf: CLBuffer,
+        up_buf: CLBuffer,
+        out_buf: CLBuffer,
+        n: int,
+    ) -> None:
+        """Run fused SwiGLU: out = SiLU(gate) * up."""
+        queue = get_queue()
+        kernel = self._registry.get_kernel("flash_attention.cl", "swiglu_f32")
+        global_size = (self._compute_global_size(n),)
+        local_size = (min(256, n),) if n >= 256 else None
+        kernel(queue, global_size, local_size,
+               gate_buf.buffer, up_buf.buffer, out_buf.buffer, np.int32(n))
 
     def run_sum_columns(
         self,

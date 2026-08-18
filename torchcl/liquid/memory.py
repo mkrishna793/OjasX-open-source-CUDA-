@@ -34,7 +34,7 @@ class LiquidMemoryPool:
                 raise MemoryError("LiquidMemoryPool OutOfMemory: collision with active buffer ranges.")
 
         sub_raw = self.raw_buf.get_sub_region(aligned_offset, nbytes, cl.mem_flags.READ_WRITE)
-        cl_buf = CLBuffer(sub_raw, nbytes, dtype, shape)
+        cl_buf = CLBuffer(sub_raw, nbytes, nbytes, dtype, shape)
         
         self.active_ranges[cl_buf._id] = (aligned_offset, end_offset)
         self.offset = end_offset
@@ -140,7 +140,7 @@ class LiquidTensor:
         view_shape = list(self.max_shape)
         view_shape[0] = end_idx - start_idx
         
-        return CLBuffer(sub_raw, size_bytes, self.dtype, tuple(view_shape))
+        return CLBuffer(sub_raw, size_bytes, size_bytes, self.dtype, tuple(view_shape))
 
     def release(self):
         """Free the underlying buffer."""

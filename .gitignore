@@ -6,6 +6,7 @@ dist/
 build/
 *.egg
 .eggs/
+.pytest_cache/
 
 # Virtual environments
 .venv/
@@ -23,14 +24,18 @@ Thumbs.db
 
 # OpenCL cache
 ~/.torchcl/
+.cache/
 
 # Distribution
 *.whl
 *.tar.gz
+
+# Upstream PyTorch & Large Clones
+pytorch_upstream/
 
 # Local Repo Kernel & Scratch
 .repo-kernel/
 tests/debug_test4.py
 tests/test_fix_matmul.py
 *.exe
-
+*.log
