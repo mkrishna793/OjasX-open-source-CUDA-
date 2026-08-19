@@ -359,11 +359,12 @@ class LinearFunction(torch.autograd.Function):
         x_shape = _get_shape(x)
         w_shape = _get_shape(weight)
         
-        M, K = x_shape
-        N, K2 = w_shape
+        K = int(x_shape[-1])
+        M = int(math.prod(x_shape[:-1])) if len(x_shape) > 1 else 1
+        N, K2 = int(w_shape[0]), int(w_shape[1])
         assert K == K2, f"Linear dimension mismatch: input {x_shape}, weight {w_shape}"
         
-        out_shape = (M, N)
+        out_shape = tuple(x_shape[:-1]) + (N,)
         out_handle, out_buf = _alloc(out_shape)
         
         x_buf = _get_buf(x)
@@ -373,6 +374,7 @@ class LinearFunction(torch.autograd.Function):
         engine.run_linear(x_buf, w_buf, bias_buf, out_buf, M, N, K)
         
         ctx.save_for_backward(x, weight, bias)
+        ctx._x_shape = x_shape
         ctx._M = M
         ctx._N = N
         ctx._K = K
@@ -384,9 +386,10 @@ class LinearFunction(torch.autograd.Function):
         x, weight, bias = ctx.saved_tensors
         engine = get_engine()
         M, N, K = ctx._M, ctx._N, ctx._K
+        x_shape = ctx._x_shape
         
         # grad_x = grad_output @ weight
-        grad_x_handle, grad_x_buf = _alloc((M, K))
+        grad_x_handle, grad_x_buf = _alloc(x_shape)
         engine.run_matmul(_get_buf(grad_output), _get_buf(weight), grad_x_buf, M, K, N)
         
         # grad_weight = grad_output.T @ x

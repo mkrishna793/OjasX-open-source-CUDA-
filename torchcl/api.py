@@ -45,7 +45,7 @@ def _next_id() -> int:
 
 def _make_handle(shape: tuple, dtype: torch.dtype = torch.float32) -> tuple[torch.Tensor, int]:
     """Create a CPU placeholder tensor and assign it a unique ID."""
-    handle = torch.empty(1, dtype=dtype)  # tiny placeholder
+    handle = torch.empty(shape, dtype=dtype)
     tid = _next_id()
     handle._torchcl_id = tid  # type: ignore[attr-defined]
     handle._torchcl_shape = shape  # type: ignore[attr-defined]
