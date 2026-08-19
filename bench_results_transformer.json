@@ -1,5 +1,5 @@
 {
-  "timestamp": "2026-08-19T05:37:13Z",
+  "timestamp": "2026-08-19T06:03:16Z",
   "hardware": {
     "device_name": "Intel(R) Iris(R) Xe Graphics",
     "compute_units": 96,
@@ -16,14 +16,14 @@
     "total_mflops": 738.197504
   },
   "performance": {
-    "vram_pinning_ms": 25.375800003530458,
-    "standard_dispatch_ms": 43.683424000046216,
-    "graph_replay_ms": 11.528972000087379,
-    "speedup_factor": 3.7890129319175325,
-    "sustained_gflops": 64.02977680875668,
-    "energy_mj_per_step": 0.17293458000131068,
-    "power_watts": 0.015,
+    "vram_pinning_ms": 4.686799999035429,
+    "standard_dispatch_ms": 17.775152000103844,
+    "graph_replay_ms": 3.238169999967795,
+    "speedup_factor": 5.489258439266816,
+    "sustained_gflops": 227.96749522333343,
+    "energy_mj_per_step": 0.04857254999951692,
+    "power_watts": 0.014999999999999998,
     "max_abs_diff_vs_cpu": 0.05382871627807617,
-    "mean_abs_diff_vs_cpu": 0.009578157216310501
+    "mean_abs_diff_vs_cpu": 0.009578158147633076
   }
 }

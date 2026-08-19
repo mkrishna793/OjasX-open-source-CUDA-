@@ -1,26 +1,143 @@
 // ═══════════════════════════════════════════════════════════════════
-// OjasX — Normalization OpenCL Kernels
-// LayerNorm, BatchNorm, RMSNorm (forward + backward)
+// OjasX — High-Performance Normalization OpenCL Kernels
+// Workgroup-Parallel LayerNorm, RMSNorm, BatchNorm
 // ═══════════════════════════════════════════════════════════════════
 
-// ── LayerNorm forward ───────────────────────────────────────────────
-// Input:  [M, N]  where M = batch * spatial, N = normalized_shape
-// Weight: [N]     (gamma)
-// Bias:   [N]     (beta)
-// Output: [M, N]
-// Mean:   [M]     (saved for backward)
-// Rstd:   [M]     (saved for backward)  rstd = 1/sqrt(var+eps)
-//
-// Each work-item handles one row (one sample's normalization).
-__kernel void layer_norm_f32(
+// ── Workgroup-Parallel LayerNorm Forward ────────────────────────────
+// Each row is computed by a full workgroup (256 threads) in parallel
+__kernel void layer_norm_workgroup_f32(
     __global const float* input,
     __global const float* weight,   // gamma [N]
     __global const float* bias,     // beta  [N]
     __global float* output,
-    __global float* mean_out,       // [M] — saved for backward
-    __global float* rstd_out,       // [M] — saved for backward
-    const int M,                    // number of rows
-    const int N,                    // normalized dimension size
+    __global float* mean_out,       // [M]
+    __global float* rstd_out,       // [M]
+    const int M,
+    const int N,
+    const float eps
+) {
+    int row = get_group_id(0);
+    if (row >= M) return;
+
+    int lid = get_local_id(0);
+    int group_size = get_local_size(0);
+
+    __local float scratch[256];
+    __local float s_mean;
+    __local float s_rstd;
+
+    int offset = row * N;
+
+    // 1. Parallel Mean Reduction
+    float my_sum = 0.0f;
+    for (int j = lid; j < N; j += group_size) {
+        my_sum += input[offset + j];
+    }
+    scratch[lid] = my_sum;
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    for (int stride = group_size / 2; stride > 0; stride >>= 1) {
+        if (lid < stride) {
+            scratch[lid] += scratch[lid + stride];
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    if (lid == 0) {
+        s_mean = scratch[0] / (float)N;
+        if (mean_out != NULL) mean_out[row] = s_mean;
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    // 2. Parallel Variance Reduction
+    float my_var = 0.0f;
+    for (int j = lid; j < N; j += group_size) {
+        float diff = input[offset + j] - s_mean;
+        my_var += diff * diff;
+    }
+    scratch[lid] = my_var;
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    for (int stride = group_size / 2; stride > 0; stride >>= 1) {
+        if (lid < stride) {
+            scratch[lid] += scratch[lid + stride];
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    if (lid == 0) {
+        float variance = scratch[0] / (float)N;
+        s_rstd = 1.0f / sqrt(variance + eps);
+        if (rstd_out != NULL) rstd_out[row] = s_rstd;
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    // 3. Parallel Normalized Output Store
+    for (int j = lid; j < N; j += group_size) {
+        float w = (weight != NULL) ? weight[j] : 1.0f;
+        float b = (bias != NULL) ? bias[j] : 0.0f;
+        output[offset + j] = (input[offset + j] - s_mean) * s_rstd * w + b;
+    }
+}
+
+// ── Workgroup-Parallel RMSNorm Forward ──────────────────────────────
+__kernel void rms_norm_workgroup_f32(
+    __global const float* input,
+    __global const float* weight,     // [N]
+    __global float* output,
+    __global float* rrms_out,         // [M]
+    const int M,
+    const int N,
+    const float eps
+) {
+    int row = get_group_id(0);
+    if (row >= M) return;
+
+    int lid = get_local_id(0);
+    int group_size = get_local_size(0);
+
+    __local float scratch[256];
+    __local float s_rrms;
+
+    int offset = row * N;
+
+    // 1. Parallel Mean(x^2) Reduction
+    float my_sq = 0.0f;
+    for (int j = lid; j < N; j += group_size) {
+        float v = input[offset + j];
+        my_sq += v * v;
+    }
+    scratch[lid] = my_sq;
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    for (int stride = group_size / 2; stride > 0; stride >>= 1) {
+        if (lid < stride) {
+            scratch[lid] += scratch[lid + stride];
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    if (lid == 0) {
+        float rms = sqrt(scratch[0] / (float)N + eps);
+        s_rrms = 1.0f / (rms > 0.0f ? rms : 1e-12f);
+        if (rrms_out != NULL) rrms_out[row] = s_rrms;
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    // 2. Parallel Scale & Store
+    for (int j = lid; j < N; j += group_size) {
+        float w = (weight != NULL) ? weight[j] : 1.0f;
+        output[offset + j] = input[offset + j] * s_rrms * w;
+    }
+}
+
+// ── Fallback 1-Thread LayerNorm Forward ─────────────────────────────
+__kernel void layer_norm_f32(
+    __global const float* input,
+    __global const float* weight,
+    __global const float* bias,
+    __global float* output,
+    __global float* mean_out,
+    __global float* rstd_out,
+    const int M,
+    const int N,
     const float eps
 ) {
     int row = get_global_id(0);
@@ -28,14 +145,12 @@ __kernel void layer_norm_f32(
 
     int offset = row * N;
 
-    // Pass 1: compute mean
     float sum = 0.0f;
     for (int j = 0; j < N; j++) {
         sum += input[offset + j];
     }
     float mu = sum / (float)N;
 
-    // Pass 2: compute variance
     float var_sum = 0.0f;
     for (int j = 0; j < N; j++) {
         float diff = input[offset + j] - mu;
@@ -44,28 +159,55 @@ __kernel void layer_norm_f32(
     float variance = var_sum / (float)N;
     float rstd = 1.0f / sqrt(variance + eps);
 
-    // Save for backward
-    mean_out[row] = mu;
-    rstd_out[row] = rstd;
+    if (mean_out != NULL) mean_out[row] = mu;
+    if (rstd_out != NULL) rstd_out[row] = rstd;
 
-    // Pass 3: normalize, scale, shift
     for (int j = 0; j < N; j++) {
-        float normed = (input[offset + j] - mu) * rstd;
-        output[offset + j] = normed * weight[j] + bias[j];
+        float w = (weight != NULL) ? weight[j] : 1.0f;
+        float b = (bias != NULL) ? bias[j] : 0.0f;
+        output[offset + j] = (input[offset + j] - mu) * rstd * w + b;
     }
 }
 
-// ── LayerNorm backward ──────────────────────────────────────────────
-// Computes grad_input, grad_weight, grad_bias from grad_output.
-// Each work-item handles one row for grad_input.
-// grad_weight and grad_bias need atomic adds (accumulated across rows).
+// ── Fallback 1-Thread RMSNorm Forward ───────────────────────────────
+__kernel void rms_norm_f32(
+    __global const float* input,
+    __global const float* weight,
+    __global float* output,
+    __global float* rrms_out,
+    const int M,
+    const int N,
+    const float eps
+) {
+    int row = get_global_id(0);
+    if (row >= M) return;
+
+    int offset = row * N;
+
+    float sq_sum = 0.0f;
+    for (int j = 0; j < N; j++) {
+        float v = input[offset + j];
+        sq_sum += v * v;
+    }
+    float rms = sqrt(sq_sum / (float)N + eps);
+    float rrms = 1.0f / (rms > 0.0f ? rms : 1e-12f);
+
+    if (rrms_out != NULL) rrms_out[row] = rrms;
+
+    for (int j = 0; j < N; j++) {
+        float w = (weight != NULL) ? weight[j] : 1.0f;
+        output[offset + j] = input[offset + j] * rrms * w;
+    }
+}
+
+// ── LayerNorm backward (grad_input) ─────────────────────────────────
 __kernel void layer_norm_backward_f32(
-    __global const float* grad_out,  // [M, N]
-    __global const float* input,     // [M, N]
-    __global const float* weight,    // [N]
-    __global const float* mean,      // [M]
-    __global const float* rstd,      // [M]
-    __global float* grad_input,      // [M, N]
+    __global const float* grad_out,
+    __global const float* input,
+    __global const float* weight,
+    __global const float* mean,
+    __global const float* rstd,
+    __global float* grad_input,
     const int M,
     const int N
 ) {
@@ -76,98 +218,77 @@ __kernel void layer_norm_backward_f32(
     float mu = mean[row];
     float rs = rstd[row];
 
-    // Compute ds = sum(grad_out * (x - mean) * rstd * weight)
-    // Compute db = sum(grad_out * weight)
     float ds = 0.0f;
     float db = 0.0f;
     for (int j = 0; j < N; j++) {
         float g = grad_out[offset + j];
         float x_hat = (input[offset + j] - mu) * rs;
-        ds += g * weight[j] * x_hat;
-        db += g * weight[j];
+        float w = (weight != NULL) ? weight[j] : 1.0f;
+        ds += g * w * x_hat;
+        db += g * w;
     }
 
-    // grad_input[i,j] = rstd * (grad_out[i,j] * weight[j]
-    //                   - (x_hat * ds + db) / N)
     float inv_N = 1.0f / (float)N;
     for (int j = 0; j < N; j++) {
         float x_hat = (input[offset + j] - mu) * rs;
         float g = grad_out[offset + j];
-        grad_input[offset + j] = rs * (g * weight[j] - inv_N * (x_hat * ds + db));
+        float w = (weight != NULL) ? weight[j] : 1.0f;
+        grad_input[offset + j] = rs * (g * w - inv_N * (x_hat * ds + db));
     }
 }
 
-// Inline atomic float addition using compare-and-swap CAS loop
-#pragma OPENCL EXTENSION cl_khr_global_int32_base_atomics : enable
-
-inline void atomic_add_float(volatile __global float* addr, float val) {
-    union { unsigned int u32; float f32; } next, expected, current;
-    current.f32 = *addr;
-    do {
-        expected.f32 = current.f32;
-        next.f32 = expected.f32 + val;
-        current.u32 = atom_cmpxchg((volatile __global unsigned int*)addr, expected.u32, next.u32);
-    } while (current.u32 != expected.u32);
-}
-
-// ── Accumulate grad_weight and grad_bias (parallelized 2D kernel) ──
-// Reduces across the M dimension in parallel.
-// gid.0 = column j, gid.1 = row i.
+// ── LayerNorm backward (grad_weight, grad_bias) ─────────────────────
 __kernel void layer_norm_grad_weight_bias_f32(
-    __global const float* grad_out,  // [M, N]
-    __global const float* input,     // [M, N]
-    __global const float* mean,      // [M]
-    __global const float* rstd,      // [M]
-    __global float* grad_weight,     // [N]
-    __global float* grad_bias,       // [N]
+    __global const float* grad_out,
+    __global const float* input,
+    __global const float* mean,
+    __global const float* rstd,
+    __global float* grad_weight,
+    __global float* grad_bias,
     const int M,
     const int N
 ) {
-    int j = get_global_id(0);
-    int i = get_global_id(1);
-    if (j >= N || i >= M) return;
+    int col = get_global_id(0);
+    if (col >= N) return;
 
-    int idx = i * N + j;
-    float g = grad_out[idx];
-    float x_hat = (input[idx] - mean[i]) * rstd[i];
-
-    atomic_add_float(&grad_weight[j], g * x_hat);
-    atomic_add_float(&grad_bias[j], g);
+    float gw = 0.0f;
+    float gb = 0.0f;
+    for (int row = 0; row < M; ++row) {
+        float g = grad_out[row * N + col];
+        float x_hat = (input[row * N + col] - mean[row]) * rstd[row];
+        gw += g * x_hat;
+        gb += g;
+    }
+    grad_weight[col] = gw;
+    grad_bias[col] = gb;
 }
 
-// ── BatchNorm forward (training mode) ───────────────────────────────
-// Input:  [N, C, spatial]  (flattened spatial dims)
-// Weight: [C] (gamma)
-// Bias:   [C] (beta)
-// Each work-item handles one channel.
+// ── BatchNorm Forward ───────────────────────────────────────────────
 __kernel void batch_norm_f32(
-    __global const float* input,      // [batch, C, spatial]
-    __global const float* weight,     // [C]
-    __global const float* bias,       // [C]
-    __global float* output,           // [batch, C, spatial]
-    __global float* mean_out,         // [C]
-    __global float* var_out,          // [C]
+    __global const float* input,
+    __global const float* weight,
+    __global const float* bias,
+    __global float* output,
+    __global float* mean_out,
+    __global float* var_out,
     const int batch_size,
     const int C,
-    const int spatial,                // H * W
+    const int spatial,
     const float eps,
-    const float momentum              // for running stats (unused here — done on CPU)
+    const float momentum
 ) {
     int c = get_global_id(0);
     if (c >= C) return;
 
-    int total = batch_size * spatial;
-
-    // Compute mean for this channel
+    int count = batch_size * spatial;
     float sum = 0.0f;
     for (int n = 0; n < batch_size; n++) {
         for (int s = 0; s < spatial; s++) {
             sum += input[n * C * spatial + c * spatial + s];
         }
     }
-    float mu = sum / (float)total;
+    float mu = sum / (float)count;
 
-    // Compute variance for this channel
     float var_sum = 0.0f;
     for (int n = 0; n < batch_size; n++) {
         for (int s = 0; s < spatial; s++) {
@@ -175,53 +296,20 @@ __kernel void batch_norm_f32(
             var_sum += diff * diff;
         }
     }
-    float variance = var_sum / (float)total;
+    float variance = var_sum / (float)count;
 
-    mean_out[c] = mu;
-    var_out[c] = variance;
+    if (mean_out != NULL) mean_out[c] = mu;
+    if (var_out != NULL) var_out[c] = variance;
 
     float rstd = 1.0f / sqrt(variance + eps);
 
-    // Normalize, scale, shift
     for (int n = 0; n < batch_size; n++) {
         for (int s = 0; s < spatial; s++) {
             int idx = n * C * spatial + c * spatial + s;
             float normed = (input[idx] - mu) * rstd;
-            output[idx] = normed * weight[c] + bias[c];
+            float w = (weight != NULL) ? weight[c] : 1.0f;
+            float b = (bias != NULL) ? bias[c] : 0.0f;
+            output[idx] = normed * w + b;
         }
-    }
-}
-
-// ── RMSNorm forward ─────────────────────────────────────────────────
-// Used in LLaMA-style models. No mean subtraction, just RMS scaling.
-// out = x / sqrt(mean(x^2) + eps) * weight
-// Each work-item handles one row.
-__kernel void rms_norm_f32(
-    __global const float* input,
-    __global const float* weight,     // [N]
-    __global float* output,
-    __global float* rrms_out,         // [M] — saved for backward
-    const int M,
-    const int N,
-    const float eps
-) {
-    int row = get_global_id(0);
-    if (row >= M) return;
-
-    int offset = row * N;
-
-    // Compute mean(x^2)
-    float sq_sum = 0.0f;
-    for (int j = 0; j < N; j++) {
-        float v = input[offset + j];
-        sq_sum += v * v;
-    }
-    float rms = sqrt(sq_sum / (float)N + eps);
-    float rrms = 1.0f / rms;
-
-    rrms_out[row] = rrms;
-
-    for (int j = 0; j < N; j++) {
-        output[offset + j] = input[offset + j] * rrms * weight[j];
     }
 }

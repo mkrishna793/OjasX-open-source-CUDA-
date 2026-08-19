@@ -10,7 +10,8 @@ import torchcl
 def test_shadow_buffer_gc():
     print("\n--- Test Shadow Buffer Garbage Collection ---")
     
-    # Check initial size of the buffer dict
+    # Establish clean baseline
+    gc.collect()
     initial_count = len(torchcl.api._opencl_buffers)
     print(f"Initial shadow buffers: {initial_count}")
     

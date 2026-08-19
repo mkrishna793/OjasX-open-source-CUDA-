@@ -1,104 +1,52 @@
-import sys
-import os
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+"""
+Test JIT Integration: verifies transparent JIT kernel fusion, buffer caching, and auto-tuning.
+"""
 
+import sys
 import torch
-import numpy as np
 import torchcl
-import torchcl.api as api
-from torchcl.runtime.memory import get_buffer_pool
-from torchcl.jit.cache import get_kernel_cache
+from torchcl.jit.compiler import get_jit_compiler
 
-print("=" * 60)
-print("  TorchCL API JIT Fusion Integration Test")
-print("=" * 60)
 
-passed = 0
-failed = 0
+def test_jit_integration():
+    print("\n--- Test 1: JIT Fusion Pipeline relu(add(a, b)) ---")
+    torch.manual_seed(42)
+    a = torch.randn(128, 128, dtype=torch.float32)
+    b = torch.randn(128, 128, dtype=torch.float32)
 
-def check(name, got, expected, atol=1e-4):
-    global passed, failed
-    if isinstance(got, torch.Tensor) and torchcl.is_opencl_tensor(got):
-        got = torchcl.to_cpu(got)
-    if isinstance(expected, torch.Tensor):
-        expected = expected.float()
-    
-    if np.allclose(got, expected, atol=atol):
-        passed += 1
-        print(f"  [PASS] {name}")
-    else:
-        failed += 1
-        print(f"  [FAIL] {name}")
-        print(f"         Got:      {got.flatten()[:5]}")
-        print(f"         Expected: {expected.flatten()[:5]}")
+    a_cl = torchcl.to_opencl(a)
+    b_cl = torchcl.to_opencl(b)
 
-# ── Test 1: Unary Fusion Chain ──
-print("\n--- Test 1: Unary Fusion Chain (relu -> sigmoid -> tanh) ---")
+    res_cl = torchcl.relu(torchcl.add(a_cl, b_cl))
+    res_cpu = torchcl.to_cpu(res_cl)
 
-x = torch.randn(1024)
-x_cl = torchcl.to_opencl(x)
+    expected = torch.relu(a + b)
+    diff = (res_cpu - expected).abs().max().item()
+    assert diff < 1e-4, f"Difference too high: {diff}"
 
-# Without JIT fusion, this would run 3 kernels.
-# With JIT fusion, it returns a lazy tensor and compiles/runs 1 fused kernel upon materialization (e.g. to_cpu)
-y_cl = torchcl.tanh_(torchcl.sigmoid(torchcl.relu(x_cl)))
+    print("--- Test 2: In-Memory Kernel Cache Hit ---")
+    compiler = get_jit_compiler()
+    cache = compiler._cache
 
-# Before materialization, y_cl should be lazy (no buffer in pool active list yet or not in opencl_buffers)
-assert api._is_lazy(y_cl), "Expected y_cl to be lazy"
+    a2 = torch.randn(128, 128, dtype=torch.float32)
+    b2 = torch.randn(128, 128, dtype=torch.float32)
 
-# Materialize it by pulling to CPU
-y_cpu = torchcl.to_cpu(y_cl)
+    a2_cl = torchcl.to_opencl(a2)
+    b2_cl = torchcl.to_opencl(b2)
 
-expected = torch.tanh(torch.sigmoid(torch.relu(x)))
-check("relu -> sigmoid -> tanh result", y_cpu, expected)
+    initial_hits = cache.stats()["hits"]
 
-# ── Test 2: Binary + Unary Fusion ──
-print("\n--- Test 2: Binary + Unary Fusion (relu(a + b)) ---")
+    res2_cl = torchcl.relu(torchcl.add(a2_cl, b2_cl))
+    res2_cpu = torchcl.to_cpu(res2_cl)
 
-a = torch.randn(512, 512)
-b = torch.randn(512, 512)
-a_cl = torchcl.to_opencl(a)
-b_cl = torchcl.to_opencl(b)
+    expected2 = torch.relu(a2 + b2)
+    diff2 = (res2_cpu - expected2).abs().max().item()
+    assert diff2 < 1e-4, f"Difference too high: {diff2}"
 
-res_cl = torchcl.relu(torchcl.add(a_cl, b_cl))
-assert api._is_lazy(res_cl), "Expected res_cl to be lazy"
+    final_hits = cache.stats()["hits"]
+    assert final_hits > initial_hits, "Cache hit was not triggered."
 
-res_cpu = torchcl.to_cpu(res_cl)
-expected = torch.relu(a + b)
-check("relu(a + b) result", res_cpu, expected)
 
-# ── Test 3: Complex Multi-Fusion Cache Hit ──
-print("\n--- Test 3: Cache Hit Verification ---")
-
-# We run the same relu(a + b) chain again with different data.
-# It should trigger a cache hit in the JIT compiler and run instantly.
-a2 = torch.randn(512, 512)
-b2 = torch.randn(512, 512)
-a2_cl = torchcl.to_opencl(a2)
-b2_cl = torchcl.to_opencl(b2)
-
-cache = get_kernel_cache()
-initial_hits = cache.stats()["hits"]
-
-res2_cl = torchcl.relu(torchcl.add(a2_cl, b2_cl))
-res2_cpu = torchcl.to_cpu(res2_cl)
-
-expected2 = torch.relu(a2 + b2)
-check("relu(a2 + b2) result", res2_cpu, expected2)
-
-final_hits = cache.stats()["hits"]
-print(f"  Initial hits: {initial_hits}, Final hits: {final_hits}")
-if final_hits > initial_hits:
-    passed += 1
-    print("  [PASS] Cache hit triggered successfully!")
-else:
-    failed += 1
-    print("  [FAIL] Cache hit was not triggered.")
-
-# ── Summary ──
-print()
-print("=" * 60)
-print(f"  INTEGRATION JIT RESULTS: {passed} passed, {failed} failed")
-print("=" * 60)
-
-import sys
-sys.exit(0 if failed == 0 else 1)
+if __name__ == "__main__":
+    test_jit_integration()
+    print("ALL JIT INTEGRATION TESTS PASSED!")

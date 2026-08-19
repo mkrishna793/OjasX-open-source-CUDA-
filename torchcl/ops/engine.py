@@ -163,31 +163,22 @@ class OpenCLEngine:
         K: int,
         use_tiled: bool = True,
     ) -> None:
-        """Run matrix multiplication: C[M,N] = A[M,K] @ B[K,N]."""
+        """Run high-performance 2D register-blocked matrix multiplication: C[M,N] = A[M,K] @ B[K,N]."""
         queue = get_queue()
-        device_info = get_device_info()
 
-        if use_tiled and M >= 16 and N >= 16 and K >= 16:
-            tile_size = 16
-            if device_info["local_mem_size_kb"] < 8:
-                tile_size = 8  # Smaller tiles for limited local memory
-
-            kernel = self._registry.get_kernel(
-                "matmul.cl", "matmul_tiled_f32",
-                build_options=f"-DTILE_SIZE={tile_size}"
-            )
-            global_size = (
-                self._compute_global_size(M, tile_size),
-                self._compute_global_size(N, tile_size),
-            )
-            local_size = (tile_size, tile_size)
+        if use_tiled and M >= 32 and N >= 32 and K >= 16:
+            kernel = self._registry.get_kernel("matmul.cl", "matmul_reg_tiled_f32")
+            bx_count = (N + 63) // 64
+            by_count = (M + 63) // 64
+            global_size = (bx_count * 16, by_count * 16)
+            local_size = (16, 16)
         else:
             kernel = self._registry.get_kernel("matmul.cl", "matmul_naive_f32")
             global_size = (
                 self._compute_global_size(M, 16),
                 self._compute_global_size(N, 16),
             )
-            local_size = None
+            local_size = (16, 16)
 
         self._enqueue_kernel(kernel, queue, global_size, local_size,
                              a_buf.buffer, b_buf.buffer, out_buf.buffer,
@@ -285,11 +276,16 @@ class OpenCLEngine:
         rows: int,
         cols: int,
     ) -> None:
-        """Run row-wise softmax."""
+        """Run high-performance workgroup-parallel row-wise softmax."""
         queue = get_queue()
-        kernel = self._registry.get_kernel("reduction.cl", "softmax_f32")
-        global_size = (self._compute_global_size(rows),)
-        local_size = None
+        if cols >= 32:
+            kernel = self._registry.get_kernel("reduction.cl", "softmax_workgroup_f32")
+            global_size = (rows * 256,)
+            local_size = (256,)
+        else:
+            kernel = self._registry.get_kernel("reduction.cl", "softmax_f32")
+            global_size = (self._compute_global_size(rows),)
+            local_size = None
         kernel(queue, global_size, local_size,
                a_buf.buffer, out_buf.buffer,
                np.int32(rows), np.int32(cols))
@@ -508,11 +504,16 @@ class OpenCLEngine:
         M: int, N: int,
         eps: float = 1e-5,
     ) -> None:
-        """Run layer normalization forward."""
+        """Run high-performance workgroup-parallel layer normalization forward."""
         queue = get_queue()
-        kernel = self._registry.get_kernel("norm.cl", "layer_norm_f32")
-        global_size = (self._compute_global_size(M),)
-        local_size = (min(256, M),) if M >= 256 else None
+        if N >= 32:
+            kernel = self._registry.get_kernel("norm.cl", "layer_norm_workgroup_f32")
+            global_size = (M * 256,)
+            local_size = (256,)
+        else:
+            kernel = self._registry.get_kernel("norm.cl", "layer_norm_f32")
+            global_size = (self._compute_global_size(M),)
+            local_size = (min(256, M),) if M >= 256 else None
         kernel(queue, global_size, local_size,
                input_buf.buffer, weight_buf.buffer, bias_buf.buffer,
                output_buf.buffer, mean_buf.buffer, rstd_buf.buffer,
@@ -554,8 +555,8 @@ class OpenCLEngine:
         self.run_fill(grad_bias_buf, 0.0, N)
         queue = get_queue()
         kernel = self._registry.get_kernel("norm.cl", "layer_norm_grad_weight_bias_f32")
-        global_size = (self._compute_global_size(N, 16), self._compute_global_size(M, 16))
-        local_size = (16, 16)
+        global_size = (self._compute_global_size(N),)
+        local_size = (min(256, N),) if N >= 256 else None
         kernel(queue, global_size, local_size,
                grad_out_buf.buffer, input_buf.buffer,
                mean_buf.buffer, rstd_buf.buffer,
@@ -706,11 +707,16 @@ class OpenCLEngine:
         M: int, N: int,
         eps: float = 1e-5,
     ) -> None:
-        """Run RMS normalization forward."""
+        """Run high-performance workgroup-parallel RMS normalization forward."""
         queue = get_queue()
-        kernel = self._registry.get_kernel("norm.cl", "rms_norm_f32")
-        global_size = (self._compute_global_size(M),)
-        local_size = (min(256, M),) if M >= 256 else None
+        if N >= 32:
+            kernel = self._registry.get_kernel("norm.cl", "rms_norm_workgroup_f32")
+            global_size = (M * 256,)
+            local_size = (256,)
+        else:
+            kernel = self._registry.get_kernel("norm.cl", "rms_norm_f32")
+            global_size = (self._compute_global_size(M),)
+            local_size = (min(256, M),) if M >= 256 else None
         kernel(queue, global_size, local_size,
                input_buf.buffer, weight_buf.buffer,
                output_buf.buffer, rrms_buf.buffer,

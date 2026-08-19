@@ -49,7 +49,13 @@ _FX_OP_MAP = {
     # Matrix & Linear
     torch.ops.aten.mm.default: "matmul",
     torch.ops.aten.bmm.default: "bmm",
+    torch.ops.aten.addmm.default: "addmm",
     torch.ops.aten.t.default: "transpose",
+    # Normalization & Softmax
+    torch.ops.aten._softmax.default: "softmax",
+    torch.ops.aten.softmax.int: "softmax",
+    torch.ops.aten.layer_norm.default: "layer_norm",
+    torch.ops.aten.native_layer_norm.default: "native_layer_norm",
 }
 
 _FUSEABLE_UNARY = {"relu", "sigmoid", "tanh", "neg", "abs", "exp", "log", "sqrt", "gelu", "silu"}
@@ -75,11 +81,36 @@ class OjasXFXInterpreter(Interpreter):
                 if not is_opencl_tensor(b): b = to_opencl(b)
                 return torchcl.matmul(a, b)
 
+            elif op_name == "addmm" and len(args) >= 3:
+                bias, a, b = args[0], args[1], args[2]
+                if not is_opencl_tensor(a): a = to_opencl(a)
+                if not is_opencl_tensor(b): b = to_opencl(b)
+                if not is_opencl_tensor(bias): bias = to_opencl(bias)
+                out = torchcl.matmul(a, b)
+                return out + bias
+
             elif op_name in ("add", "sub", "mul", "div") and len(args) >= 2:
                 a, b = args[0], args[1]
                 if not is_opencl_tensor(a): a = to_opencl(a)
                 if not is_opencl_tensor(b): b = to_opencl(b)
                 return getattr(torchcl, op_name)(a, b)
+
+            elif op_name == "softmax" and len(args) >= 1:
+                a = args[0]
+                if not is_opencl_tensor(a): a = to_opencl(a)
+                dim = kwargs.get("dim", args[1] if len(args) > 1 else -1)
+                return torchcl.softmax(a, dim=dim)
+
+            elif op_name in ("layer_norm", "native_layer_norm") and len(args) >= 2:
+                a = args[0]
+                normalized_shape = args[1]
+                weight = kwargs.get("weight", args[2] if len(args) > 2 else None)
+                bias = kwargs.get("bias", args[3] if len(args) > 3 else None)
+                eps = kwargs.get("eps", args[4] if len(args) > 4 else 1e-5)
+                if not is_opencl_tensor(a): a = to_opencl(a)
+                if weight is not None and not is_opencl_tensor(weight): weight = to_opencl(weight)
+                if bias is not None and not is_opencl_tensor(bias): bias = to_opencl(bias)
+                return torchcl.layer_norm(a, normalized_shape, weight, bias, eps)
 
         # Fallback to standard function execution
         cpu_args = torch.utils._pytree.tree_map(lambda x: to_cpu(x) if is_opencl_tensor(x) else x, args)
