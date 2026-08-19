@@ -184,6 +184,36 @@ class OpenCLEngine:
                              a_buf.buffer, b_buf.buffer, out_buf.buffer,
                              np.int32(M), np.int32(N), np.int32(K))
 
+    def run_matmul_bias(
+        self,
+        a_buf: CLBuffer,
+        b_buf: CLBuffer,
+        bias_buf: CLBuffer,
+        out_buf: CLBuffer,
+        M: int,
+        N: int,
+        K: int,
+    ) -> None:
+        """Run matrix multiplication with fused bias: C[M,N] = A[M,K] @ B[K,N] + bias[N]."""
+        queue = get_queue()
+        if M >= 32 and N >= 32 and K >= 16:
+            kernel = self._registry.get_kernel("matmul.cl", "matmul_reg_tiled_bias_f32")
+            bx_count = (N + 63) // 64
+            by_count = (M + 63) // 64
+            global_size = (bx_count * 16, by_count * 16)
+            local_size = (16, 16)
+        else:
+            kernel = self._registry.get_kernel("matmul.cl", "matmul_bias_f32")
+            global_size = (
+                self._compute_global_size(M, 16),
+                self._compute_global_size(N, 16),
+            )
+            local_size = (16, 16)
+
+        self._enqueue_kernel(kernel, queue, global_size, local_size,
+                             a_buf.buffer, b_buf.buffer, bias_buf.buffer, out_buf.buffer,
+                             np.int32(M), np.int32(N), np.int32(K))
+
     def run_matmul_fp16(
         self,
         a_buf: CLBuffer,

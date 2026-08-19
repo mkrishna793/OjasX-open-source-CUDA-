@@ -356,6 +356,10 @@ class LinearFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor] = None) -> torch.Tensor:
         engine = get_engine()
+        if not is_opencl_tensor(x): x = to_opencl(x)
+        if not is_opencl_tensor(weight): weight = to_opencl(weight)
+        if bias is not None and not is_opencl_tensor(bias): bias = to_opencl(bias)
+
         x_shape = _get_shape(x)
         w_shape = _get_shape(weight)
         

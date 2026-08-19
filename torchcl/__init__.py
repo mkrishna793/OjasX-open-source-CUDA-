@@ -52,7 +52,9 @@ from torchcl.api import (
     is_opencl_tensor,
     # Creation
     zeros,
+    zeros_like,
     ones,
+    ones_like,
     full,
     randn,
     # Arithmetic

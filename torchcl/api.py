@@ -250,6 +250,22 @@ def zeros(*shape, dtype: torch.dtype = torch.float32) -> torch.Tensor:
     return _wrap_output(cl_buf, shape, dtype)
 
 
+def zeros_like(tensor: torch.Tensor, dtype: torch.dtype | None = None) -> torch.Tensor:
+    """Create a zero-filled tensor with the same shape as input on OpenCL."""
+    shape = _get_shape(tensor)
+    if dtype is None:
+        dtype = _get_dtype(tensor)
+    return zeros(shape, dtype=dtype)
+
+
+def ones_like(tensor: torch.Tensor, dtype: torch.dtype | None = None) -> torch.Tensor:
+    """Create a one-filled tensor with the same shape as input on OpenCL."""
+    shape = _get_shape(tensor)
+    if dtype is None:
+        dtype = _get_dtype(tensor)
+    return ones(shape, dtype=dtype)
+
+
 def ones(*shape, dtype: torch.dtype = torch.float32) -> torch.Tensor:
     """Create a ones-filled tensor on OpenCL."""
     if len(shape) == 1 and isinstance(shape[0], (tuple, list)):

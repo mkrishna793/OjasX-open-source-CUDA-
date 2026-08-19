@@ -1,11 +1,9 @@
 // ═══════════════════════════════════════════════════════════════════
-// OjasX Liquid — ODE Integration Kernels
-// Euler, RK2, RK4, Adaptive RK23 with error control
+// OjasX Liquid & ojasDynamical — ODE Integration Kernels
+// Euler, RK2, RK4, Adaptive RK23 with error control & Vector Solvers
 // ═══════════════════════════════════════════════════════════════════
 
 // Generic ODE: dS/dt = F(S, X) where F = (-S + X) / tau
-// These kernels work on arbitrary state vectors.
-
 __kernel void ode_euler_f32(
     __global const float* target,
     __global float* state,
@@ -100,4 +98,39 @@ __kernel void ode_adaptive_f32(
     state[gid] = s_rk3;
     output[gid] = s_rk3;
     error_out[gid] = err;
+}
+
+// ── General-Purpose Vector RK4 Step (ojasDynamical) ─────────────────
+// y_next = y + (h / 6) * (k1 + 2*k2 + 2*k3 + k4)
+__kernel void rk4_step_f32(
+    __global const float* y,
+    __global const float* k1,
+    __global const float* k2,
+    __global const float* k3,
+    __global const float* k4,
+    __global float* y_next,
+    const float h,
+    const int numel
+) {
+    int i = get_global_id(0);
+    if (i >= numel) return;
+
+    float delta = (k1[i] + 2.0f * k2[i] + 2.0f * k3[i] + k4[i]) * (h / 6.0f);
+    y_next[i] = y[i] + delta;
+}
+
+// ── Liquid Continuous-Time State Decay: dh/dt = -h / tau + tanh(act)
+__kernel void liquid_decay_dynamics_f32(
+    __global const float* h_curr,
+    __global const float* linear_act,
+    __global float* dh_out,
+    const float tau,
+    const int numel
+) {
+    int i = get_global_id(0);
+    if (i >= numel) return;
+
+    float decay = -h_curr[i] / (tau > 0.0f ? tau : 1.0f);
+    float excitation = tanh(linear_act[i]);
+    dh_out[i] = decay + excitation;
 }
