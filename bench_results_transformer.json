@@ -1,0 +1,29 @@
+{
+  "timestamp": "2026-08-19T05:37:13Z",
+  "hardware": {
+    "device_name": "Intel(R) Iris(R) Xe Graphics",
+    "compute_units": 96,
+    "vram_mb": 6466,
+    "driver_version": "30.0.101.1003"
+  },
+  "workload": {
+    "architecture": "LLaMA-3 Transformer Block (RMSNorm + FlashAttention + SwiGLU)",
+    "batch_size": 4,
+    "seq_len": 128,
+    "embedding_dim": 256,
+    "attention_heads": 8,
+    "swiglu_hidden_dim": 512,
+    "total_mflops": 738.197504
+  },
+  "performance": {
+    "vram_pinning_ms": 25.375800003530458,
+    "standard_dispatch_ms": 43.683424000046216,
+    "graph_replay_ms": 11.528972000087379,
+    "speedup_factor": 3.7890129319175325,
+    "sustained_gflops": 64.02977680875668,
+    "energy_mj_per_step": 0.17293458000131068,
+    "power_watts": 0.015,
+    "max_abs_diff_vs_cpu": 0.05382871627807617,
+    "mean_abs_diff_vs_cpu": 0.009578157216310501
+  }
+}
