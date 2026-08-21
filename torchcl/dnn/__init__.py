@@ -1,6 +1,8 @@
 """
 ojasDNN — High-Performance Deep Neural Network & Attention Primitives for OjasX.
 Replaces cuDNN & FlashAttention with Categorical Monoidal Attention (CMA) and Workgroup-Parallel Reductions.
+
+v3: Integrated with CostAwareDispatcher for hardware-optimal strategy selection.
 """
 
 from __future__ import annotations

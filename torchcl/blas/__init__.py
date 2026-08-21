@@ -1,6 +1,8 @@
 """
 ojasBLAS — High-Performance Sub-Cubic & Hardware-Aware Matrix Math Library for OjasX.
 Replaces cuBLAS / CUTLASS with 2D Register Tiling, Winograd Transforms, and Zero-Skipping.
+
+v3: Now routes through CostAwareDispatcher for automatic strategy selection.
 """
 
 from __future__ import annotations
@@ -17,26 +19,50 @@ def gemm(
     b: torch.Tensor,
     bias: torch.Tensor | None = None,
     activation: str | None = None,
+    strategy: str | None = None,
 ) -> torch.Tensor:
-    """Universal 2D Register-Blocked SGEMM with fused bias and activation."""
+    """Universal SGEMM with cost-aware automatic strategy selection.
+
+    Args:
+        strategy: Force a specific strategy ("tiled", "winograd", "sparse", None=auto).
+                  When None, the CostAwareDispatcher profiles the data and picks the best.
+    """
     if not is_opencl_tensor(a): a = to_opencl(a)
     if not is_opencl_tensor(b): b = to_opencl(b)
-    
+
     M, K = a.shape
     K2, N = b.shape
     assert K == K2, f"Dimension mismatch: {K} != {K2}"
 
-    engine = get_engine()
-    out_buf = engine._pool.allocate(M * N * 4)
+    # ── Cost-aware strategy selection ────────────────────────────
+    if strategy is None:
+        try:
+            from torchcl.dispatch import get_dispatcher
+            dispatcher = get_dispatcher()
+            sparsity = dispatcher.profile_sparsity(a)
+            candidates = dispatcher.get_candidates("gemm", (M, N), sparsity)
+            best = dispatcher.select_best("gemm", candidates, M, N, K)
+            strategy = best.strategy
+        except Exception:
+            strategy = "tiled"  # Safe fallback
 
-    if bias is not None:
-        if not is_opencl_tensor(bias): bias = to_opencl(bias)
-        engine.run_matmul_bias(_get_buf(a), _get_buf(b), _get_buf(bias), out_buf, M, N, K)
+    # ── Execute with selected strategy ───────────────────────────
+    if strategy == "winograd" and M >= 4 and N >= 4:
+        out = winograd_gemm(a, b)
+    elif strategy == "sparse":
+        out = sparse_gemm(a, b)
     else:
-        engine.run_matmul(_get_buf(a), _get_buf(b), out_buf, M, N, K)
+        # Default tiled path (proven, battle-tested)
+        engine = get_engine()
+        out_buf = engine._pool.allocate(M * N * 4)
+        if bias is not None:
+            if not is_opencl_tensor(bias): bias = to_opencl(bias)
+            engine.run_matmul_bias(_get_buf(a), _get_buf(b), _get_buf(bias), out_buf, M, N, K)
+        else:
+            engine.run_matmul(_get_buf(a), _get_buf(b), out_buf, M, N, K)
+        out = _wrap_output(out_buf, (M, N))
 
-    out = _wrap_output(out_buf, (M, N))
-
+    # ── Fused activation ─────────────────────────────────────────
     if activation == "relu":
         out = torchcl.relu(out)
     elif activation == "gelu":
