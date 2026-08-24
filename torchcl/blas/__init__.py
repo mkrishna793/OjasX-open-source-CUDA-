@@ -34,35 +34,43 @@ def gemm(
     K2, N = b.shape
     assert K == K2, f"Dimension mismatch: {K} != {K2}"
 
-    # ── Cost-aware strategy selection ────────────────────────────
+    # Auto: register-tiled GEMM. Winograd/sparse only when the caller asks —
+    # the 2x2 Winograd kernel is un-tiled and loses to register blocking on
+    # every size we care about. Never download a sparsity sample on this path.
     if strategy is None:
-        try:
-            from torchcl.dispatch import get_dispatcher
-            dispatcher = get_dispatcher()
-            sparsity = dispatcher.profile_sparsity(a)
-            candidates = dispatcher.get_candidates("gemm", (M, N), sparsity)
-            best = dispatcher.select_best("gemm", candidates, M, N, K)
-            strategy = best.strategy
-        except Exception:
-            strategy = "tiled"  # Safe fallback
+        strategy = "tiled"
 
-    # ── Execute with selected strategy ───────────────────────────
+    engine = get_engine()
     if strategy == "winograd" and M >= 4 and N >= 4:
         out = winograd_gemm(a, b)
-    elif strategy == "sparse":
+        if activation == "relu":
+            out = torchcl.relu(out)
+        elif activation == "gelu":
+            out = torchcl.gelu(out)
+        elif activation == "silu":
+            out = torchcl.silu(out)
+        return out
+    if strategy == "sparse":
         out = sparse_gemm(a, b)
-    else:
-        # Default tiled path (proven, battle-tested)
-        engine = get_engine()
-        out_buf = engine._pool.allocate(M * N * 4)
-        if bias is not None:
-            if not is_opencl_tensor(bias): bias = to_opencl(bias)
-            engine.run_matmul_bias(_get_buf(a), _get_buf(b), _get_buf(bias), out_buf, M, N, K)
-        else:
-            engine.run_matmul(_get_buf(a), _get_buf(b), out_buf, M, N, K)
-        out = _wrap_output(out_buf, (M, N))
+        if activation:
+            out = getattr(torchcl, activation)(out)
+        return out
 
-    # ── Fused activation ─────────────────────────────────────────
+    out_buf = engine.allocate_output((M, N))
+    if bias is not None:
+        if not is_opencl_tensor(bias):
+            bias = to_opencl(bias)
+        engine.run_matmul_bias(
+            _get_buf(a), _get_buf(b), _get_buf(bias), out_buf, M, N, K,
+            activation=activation if activation == "relu" else None,
+        )
+        out = _wrap_output(out_buf, (M, N))
+        if activation and activation != "relu":
+            out = getattr(torchcl, activation)(out)
+        return out
+
+    engine.run_matmul(_get_buf(a), _get_buf(b), out_buf, M, N, K)
+    out = _wrap_output(out_buf, (M, N))
     if activation == "relu":
         out = torchcl.relu(out)
     elif activation == "gelu":

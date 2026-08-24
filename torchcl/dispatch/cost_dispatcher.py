@@ -165,52 +165,28 @@ class CostAwareDispatcher:
                        sparsity: float = 0.0) -> list[KernelCandidate]:
         """Generate candidate kernel strategies for an operation."""
         candidates = []
-        vendor = self.device_info.vendor_short
 
         if op in ("gemm", "matmul"):
-            M = shape[0] if len(shape) > 0 else 1
-            N = shape[1] if len(shape) > 1 else 1
-            K = shape[1] if len(shape) > 1 else 1
+            M = int(shape[0]) if len(shape) > 0 else 1
+            N = int(shape[1]) if len(shape) > 1 else 1
+            K = int(shape[2]) if len(shape) > 2 else N
 
-            # 1. Always include hand-tuned tiled GEMM
-            if M >= 32 and N >= 32:
+            if M >= 32 and N >= 32 and K >= 16:
                 candidates.append(KernelCandidate(
                     name="tiled_gemm", strategy="tiled",
                     kernel_file="matmul.cl",
                     kernel_function="matmul_reg_tiled_f32",
                     workgroup_size=256, tile_m=64, tile_n=64, tile_k=16,
                 ))
-
-            # 2. Winograd for suitable sizes
-            if M >= 4 and N >= 4 and K >= 4:
+            else:
                 candidates.append(KernelCandidate(
-                    name="winograd_gemm", strategy="winograd",
-                    kernel_file="winograd_gemm.cl",
-                    kernel_function="matmul_winograd_2x2_f32",
+                    name="naive_gemm", strategy="naive",
+                    kernel_file="matmul.cl",
+                    kernel_function="matmul_naive_f32",
                     workgroup_size=256,
                 ))
-
-            # 3. Sparse GEMM when high sparsity detected
-            if sparsity > 0.3:
-                candidates.append(KernelCandidate(
-                    name="sparse_gemm", strategy="sparse",
-                    kernel_file="winograd_gemm.cl",
-                    kernel_function="matmul_zero_skip_f32",
-                    workgroup_size=256,
-                ))
-
-            # 4. Naive fallback for small matrices
-            candidates.append(KernelCandidate(
-                name="naive_gemm", strategy="naive",
-                kernel_file="matmul.cl",
-                kernel_function="matmul_naive_f32",
-                workgroup_size=256,
-            ))
-
-            # 5. Synthesized vendor-specific kernel
-            synth = self._synthesizer.synthesize_gemm(M, N, K, vendor)
-            if synth is not None:
-                candidates.append(synth)
+            # Winograd / sparse are opt-in. Auto-picking them used to beat
+            # tiled in the paper cost model while losing on the wire.
 
         elif op in ("relu", "sigmoid", "gelu", "silu", "tanh",
                      "leaky_relu"):
@@ -283,8 +259,11 @@ class CostAwareDispatcher:
         })
 
     def profile_sparsity(self, tensor: torch.Tensor, max_samples: int = 256) -> float:
-        """O(1) sparsity estimation by sampling."""
+        """O(1) sparsity estimate. Never download an OpenCL tensor to do it."""
         if tensor.numel() == 0:
+            return 0.0
+        from torchcl.api import is_opencl_tensor
+        if is_opencl_tensor(tensor):
             return 0.0
         flat = tensor.detach().cpu().flatten()
         n = min(max_samples, flat.numel())
