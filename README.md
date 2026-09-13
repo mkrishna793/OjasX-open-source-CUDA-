@@ -23,6 +23,7 @@
 </p>
 
 ---
+note:- this readme isn't updated so plz go with the every file in this project yet this project is in the cooking we are devloping it and stay tune for the future update for the OJASX which is coming with more deeply developed and also more mature C++ backends with the more robust the improvments fo this next version is gone be craxy so stay tune 
 
 ## 💡 The Problem
 
