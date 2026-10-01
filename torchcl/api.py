@@ -439,33 +439,8 @@ def matmul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
         raise ValueError(f"matmul dimension mismatch: {a_shape} @ {b_shape}")
 
     out_shape = (M, N)
-
-    from torchcl.liquid.dispatch import get_dispatcher
-    from torchcl.liquid.precision import AdaptivePrecision
-
-    dispatcher = get_dispatcher()
-    config = dispatcher.dispatch("matmul", a)
-
-    if config.precision == "half":
-        ap = AdaptivePrecision()
-        a_fp16 = ap.pack_to_fp16(_get_buf(a), M * K)
-        b_fp16 = ap.pack_to_fp16(_get_buf(b), K * N)
-        out_fp16 = get_buffer_pool().allocate(M * N * 2, np.dtype(np.float16), out_shape)
-        engine.run_matmul_fp16(
-            a_fp16, b_fp16, out_fp16, M, N, K,
-            use_tiled=(config.strategy == "tiled")
-        )
-        out_buf = ap.unpack_from_fp16(out_fp16, M * N)
-        get_buffer_pool().free(a_fp16)
-        get_buffer_pool().free(b_fp16)
-        get_buffer_pool().free(out_fp16)
-    else:
-        out_buf = engine.allocate_output(out_shape)
-        engine.run_matmul(
-            _get_buf(a), _get_buf(b), out_buf, M, N, K,
-            use_tiled=(config.strategy == "tiled")
-        )
-
+    out_buf = engine.allocate_output(out_shape)
+    engine.run_matmul(_get_buf(a), _get_buf(b), out_buf, M, N, K)
     return _wrap_output(out_buf, out_shape)
 
 

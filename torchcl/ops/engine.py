@@ -44,8 +44,14 @@ class OpenCLEngine:
     # ── Tensor ↔ Buffer conversion ───────────────────────────────
 
     def tensor_to_buffer(self, tensor: torch.Tensor) -> CLBuffer:
-        """Upload a PyTorch (CPU) tensor to an OpenCL buffer."""
-        np_array = tensor.detach().cpu().numpy()
+        """Return the existing device buffer, or upload from host. Never copy a tensor that is already on OpenCL."""
+        try:
+            from torchcl.api import is_opencl_tensor, _get_buf
+            if is_opencl_tensor(tensor):
+                return _get_buf(tensor)
+        except Exception:
+            pass
+        np_array = np.ascontiguousarray(tensor.detach().cpu().numpy())
         return self._pool.host_to_device(np_array)
 
     def buffer_to_tensor(
@@ -153,6 +159,11 @@ class OpenCLEngine:
         args.extend([out_buf.buffer, np.int32(n)])
         kernel(queue, global_size, local_size, *args)
 
+    def _gemm_launch_geom(self, M: int, N: int) -> tuple[tuple[int, int], tuple[int, int]]:
+        bx_count = (N + 63) // 64
+        by_count = (M + 63) // 64
+        return (bx_count * 16, by_count * 16), (16, 16)
+
     def run_matmul(
         self,
         a_buf: CLBuffer,
@@ -163,15 +174,11 @@ class OpenCLEngine:
         K: int,
         use_tiled: bool = True,
     ) -> None:
-        """Run high-performance 2D register-blocked matrix multiplication: C[M,N] = A[M,K] @ B[K,N]."""
+        """C[M,N] = A[M,K] @ B[K,N]. Register-blocked when the problem is large enough."""
         queue = get_queue()
-
         if use_tiled and M >= 32 and N >= 32 and K >= 16:
             kernel = self._registry.get_kernel("matmul.cl", "matmul_reg_tiled_f32")
-            bx_count = (N + 63) // 64
-            by_count = (M + 63) // 64
-            global_size = (bx_count * 16, by_count * 16)
-            local_size = (16, 16)
+            global_size, local_size = self._gemm_launch_geom(M, N)
         else:
             kernel = self._registry.get_kernel("matmul.cl", "matmul_naive_f32")
             global_size = (
@@ -193,15 +200,15 @@ class OpenCLEngine:
         M: int,
         N: int,
         K: int,
+        activation: str | None = None,
     ) -> None:
-        """Run matrix multiplication with fused bias: C[M,N] = A[M,K] @ B[K,N] + bias[N]."""
+        """C[M,N] = act(A[M,K] @ B[K,N] + bias[N]). One kernel when tiled."""
         queue = get_queue()
+        fused_relu = activation == "relu"
         if M >= 32 and N >= 32 and K >= 16:
-            kernel = self._registry.get_kernel("matmul.cl", "matmul_reg_tiled_bias_f32")
-            bx_count = (N + 63) // 64
-            by_count = (M + 63) // 64
-            global_size = (bx_count * 16, by_count * 16)
-            local_size = (16, 16)
+            kname = "matmul_reg_tiled_bias_relu_f32" if fused_relu else "matmul_reg_tiled_bias_f32"
+            kernel = self._registry.get_kernel("matmul.cl", kname)
+            global_size, local_size = self._gemm_launch_geom(M, N)
         else:
             kernel = self._registry.get_kernel("matmul.cl", "matmul_bias_f32")
             global_size = (
@@ -209,10 +216,13 @@ class OpenCLEngine:
                 self._compute_global_size(N, 16),
             )
             local_size = (16, 16)
+            fused_relu = False
 
         self._enqueue_kernel(kernel, queue, global_size, local_size,
                              a_buf.buffer, b_buf.buffer, bias_buf.buffer, out_buf.buffer,
                              np.int32(M), np.int32(N), np.int32(K))
+        if activation == "relu" and not fused_relu:
+            self.run_activation("relu_f32", out_buf, out_buf, M * N)
 
     def run_matmul_fp16(
         self,
@@ -359,12 +369,22 @@ class OpenCLEngine:
         K: int,
         use_tiled: bool = True,
     ) -> None:
-        """Run fused linear layer: C[M,N] = A[M,K] @ B[N,K]^T + bias[N]."""
+        """C[M,N] = A[M,K] @ W[N,K]^T + bias[N]. Register-blocked NT — no weight transpose."""
         queue = get_queue()
-        device_info = get_device_info()
         has_bias = 1 if bias_buf is not None else 0
         bias_raw = bias_buf.buffer if bias_buf is not None else a_buf.buffer
 
+        if use_tiled and M >= 32 and N >= 32 and K >= 16:
+            kernel = self._registry.get_kernel("matmul.cl", "linear_reg_tiled_f32")
+            global_size, local_size = self._gemm_launch_geom(M, N)
+            self._enqueue_kernel(
+                kernel, queue, global_size, local_size,
+                a_buf.buffer, b_buf.buffer, bias_raw, out_buf.buffer,
+                np.int32(M), np.int32(N), np.int32(K), np.int32(has_bias),
+            )
+            return
+
+        device_info = get_device_info()
         if use_tiled and M >= 16 and N >= 16 and K >= 16:
             tile_size = 16
             if device_info["local_mem_size_kb"] < 8:

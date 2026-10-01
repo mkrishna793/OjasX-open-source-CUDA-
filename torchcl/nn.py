@@ -43,6 +43,7 @@ from torchcl.autograd import (
     GeluFunction,
     SiluFunction,
     LeakyReluFunction,
+    LinearFunction,
     MatmulFunction,
     AddFunction,
     LayerNormFunction,
@@ -90,33 +91,7 @@ class OpenCLLinear(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         self._ensure_on_gpu()
-        engine = get_engine()
-
-        x_shape = _get_shape(x)
-        if len(x_shape) != 2:
-            raise ValueError(f"OpenCLLinear expects 2D input, got shape {x_shape}")
-
-        batch, in_feat = x_shape
-        assert in_feat == self.in_features, (
-            f"Expected input feature size {self.in_features}, got {in_feat}"
-        )
-
-        # Transpose weight: [out, in] → [in, out]
-        wt_handle, wt_buf = _alloc_helper((self.in_features, self.out_features))
-        engine.run_transpose(
-            _get_buf(self._weight_gpu), wt_buf,
-            self.out_features, self.in_features,
-        )
-
-        # Matmul: [batch, in] @ [in, out] → [batch, out]
-        result = MatmulFunction.apply(x, _wrap_output(wt_buf, (self.in_features, self.out_features)))
-
-        # Add bias if present
-        if self.bias is not None:
-            # Broadcast bias: repeat bias for each row in batch
-            result = _add_bias(result, self._bias_gpu, batch, self.out_features)
-
-        return result
+        return LinearFunction.apply(x, self._weight_gpu, self._bias_gpu)
 
 
 # ═══════════════════════════════════════════════════════════════════════
